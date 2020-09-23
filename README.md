@@ -1,2 +1,3 @@
-# tuzi
+# TuZi
+
 Service Mesh / Sidecar Proxy.

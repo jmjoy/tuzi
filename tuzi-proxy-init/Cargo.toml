@@ -1,0 +1,9 @@
+[package]
+name = "tuzi-proxy-init"
+version = "0.1.0"
+authors = ["jmjoy <918734043@qq.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
