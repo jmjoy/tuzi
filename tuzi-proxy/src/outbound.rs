@@ -1,7 +1,10 @@
-use crate::tcp::{orig_dst_addr, Addrs};
-use std::time::SystemTime;
+use crate::{
+    detect::detect_protocol,
+    tcp::{orig_dst_addr, Addrs},
+};
+use std::{sync::Once, time::SystemTime};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     try_join,
 };
@@ -40,28 +43,50 @@ pub async fn run() -> anyhow::Result<()> {
                 orig_dst,
             };
 
-            handle(addrs, socket, context).await;
+            handle(addrs, socket, context).await.unwrap();
         });
     }
 }
 
 #[instrument(name = "outbound::handle", skip(socket, context))]
 async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow::Result<()> {
-    let mut original = TcpStream::connect(addrs.orig_dst).await.unwrap();
+    let mut orig = TcpStream::connect(addrs.orig_dst).await.unwrap();
 
-    let (mut ri, mut wi) = socket.split();
-    let (mut ro, mut wo) = original.split();
+    let (mut socket_read, mut socket_write) = socket.split();
+    let (mut orig_read, mut orig_write) = orig.split();
 
     let client_to_server = async {
-        let copied = tokio::io::copy(&mut ri, &mut wo).await?;
+        let mut buf = [0; 2048];
+        let mut copied = 0;
+
+        let once = Once::new();
+
+        loop {
+            let n = socket_read.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            copied += n;
+
+            once.call_once(|| match detect_protocol(&buf[..n]) {
+                Some(info) => info!(?info, "protocol: http"),
+                None => info!("protocol: unknown"),
+            });
+
+            let n = orig_write.write(&buf[..n]).await.unwrap();
+            if n == 0 {
+                panic!("Write zero");
+            }
+        }
+
         info!(copied);
-        wo.shutdown().await
+        orig_write.shutdown().await
     };
 
     let server_to_client = async {
-        let copied = tokio::io::copy(&mut ro, &mut wi).await?;
+        let copied = tokio::io::copy(&mut orig_read, &mut socket_write).await?;
         info!(copied);
-        wi.shutdown().await
+        socket_write.shutdown().await
     };
 
     try_join!(client_to_server, server_to_client).unwrap();

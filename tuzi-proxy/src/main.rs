@@ -1,4 +1,5 @@
 mod app;
+mod detect;
 mod inbound;
 mod outbound;
 mod tcp;
