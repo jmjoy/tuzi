@@ -1,10 +1,7 @@
-use crate::{
-    detect::detect_protocol,
-    tcp::{orig_dst_addr, Addrs},
-};
-use std::{sync::Once, time::SystemTime};
+use crate::{detect::detect_protocol, detect::detect_protocol_with_term, tcp::{orig_dst_addr, Addrs}};
+use std::{io::Cursor, sync::Once, time::SystemTime};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek},
     net::{TcpListener, TcpStream},
     try_join,
 };
@@ -50,16 +47,23 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[instrument(name = "outbound::handle", skip(socket, context))]
 async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow::Result<()> {
+    info!("before connect to orig_dst");
     let mut orig = TcpStream::connect(addrs.orig_dst).await.unwrap();
 
-    let (mut socket_read, mut socket_write) = socket.split();
+    let (socket_read, mut socket_write) = socket.split();
     let (mut orig_read, mut orig_write) = orig.split();
 
+    let mut socket_read = BufReader::new(socket_read);
+
+    let mut term = 0;
+
     let client_to_server = async {
-        let mut buf = [0; 2048];
+        let mut buf = [0; 4096];
         let mut copied = 0;
 
         let once = Once::new();
+
+        let mut new_buf = Vec::new();
 
         loop {
             let n = socket_read.read(&mut buf).await.unwrap();
@@ -68,15 +72,29 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
             }
             copied += n;
 
-            once.call_once(|| match detect_protocol(&buf[..n]) {
-                Some(info) => info!(?info, "protocol: http"),
-                None => info!("protocol: unknown"),
-            });
+            // once.call_once(|| match detect_protocol(&buf[..n], &mut new_buf) {
+            //     Some(info) => info!(?info, "protocol: http"),
+            //     None => info!("protocol: unknown"),
+            // });
 
-            let n = orig_write.write(&buf[..n]).await.unwrap();
+            if term == 0 {
+                let protocol = detect_protocol_with_term(&buf);
+                info!(?protocol, "detect protocol");
+            }
+
+            let write_buf = if new_buf.is_empty() {
+                &buf[..n]
+            } else {
+                &new_buf[..]
+            };
+            let n = orig_write.write(write_buf).await.unwrap();
             if n == 0 {
                 panic!("Write zero");
             }
+
+            new_buf.clear();
+
+            term += 1;
         }
 
         info!(copied);

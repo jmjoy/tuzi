@@ -3,6 +3,7 @@ mod detect;
 mod inbound;
 mod outbound;
 mod tcp;
+mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
