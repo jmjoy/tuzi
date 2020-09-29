@@ -14,6 +14,8 @@ use tracing::info;
 #[derive(Debug)]
 pub enum Protocol {
     HTTP_1,
+    REDIS,
+    MYSQL,
 }
 
 #[derive(Debug, PartialEq)]
@@ -24,7 +26,11 @@ pub struct HttpRequestInfo {
 }
 
 pub fn detect_protocol_with_term(input: &[u8]) -> Option<Protocol> {
-    match map(http_method, |_| Protocol::HTTP_1)(input) {
+    match alt((
+        map(http_method, |_| Protocol::HTTP_1),
+        map(redis, |_| Protocol::REDIS),
+        map(mysql, |_| Protocol::MYSQL),
+    ))(input) {
         Ok((_, protocol)) => Some(protocol),
         Err(_) => None,
     }
@@ -71,6 +77,14 @@ fn http_method(input: &[u8]) -> IResult<&[u8], Method> {
         value(Method::PUT, tag("PUT")),
         value(Method::DELETE, tag("DELETE")),
     ))(input)
+}
+
+fn redis(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    tag("*")(input)
+}
+
+fn mysql(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    tag([10])(input)
 }
 
 #[cfg(test)]
