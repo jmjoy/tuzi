@@ -157,8 +157,10 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
             Some(input) => input,
             None => return,
         };
-        match detect::redis(&input) {
-            Ok(_) => info!("detect redis"),
+        match detect::redis_args_count(&input) {
+            Ok((remain, _)) => {
+                info!("detect redis: {}", std::str::from_utf8(remain).unwrap());
+            }
             Err(e) => match e {
                 nom::Err::Incomplete(..) => {}
                 nom::Err::Error((_, kind)) => {

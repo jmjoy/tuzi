@@ -120,28 +120,33 @@ mod tests {
     use super::*;
     use nom::{bytes::streaming::tag, IResult};
 
+    // #[test]
+    // fn test_reader_buffer() {
+    //     let rb = ReaderBuffer::new();
+    //     rb.buffer.write().unwrap().extend_from_slice(b"hel");
+
+    //     fn parser(rb: ReaderBuffer) -> IResult<ReaderBuffer, ReaderBuffer> {
+    //         tag("hello")(rb)
+    //     }
+
+    //     loop {
+    //         match parser(rb.clone()) {
+    //             Ok(_) => {
+    //                 dbg!("ok");
+    //                 break;
+    //             }
+    //             Err(err) => {
+    //                 if err.is_incomplete() {
+    //                     rb.buffer.write().unwrap().extend_from_slice(b"hel");
+    //                     buffer.extend_from_slice(b"loooo");
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
     #[test]
-    fn test_reader_buffer() {
-        let rb = ReaderBuffer::new();
-        rb.buffer.write().unwrap().extend_from_slice(b"hel");
+    fn test_nom_streaming() {
 
-        fn parser(rb: ReaderBuffer) -> IResult<ReaderBuffer, ReaderBuffer> {
-            tag("hello")(rb)
-        }
-
-        loop {
-            match parser(rb.clone()) {
-                Ok(_) => {
-                    dbg!("ok");
-                    break;
-                }
-                Err(err) => {
-                    if err.is_incomplete() {
-                        rb.buffer.write().unwrap().extend_from_slice(b"hel");
-                        buffer.extend_from_slice(b"loooo");
-                    }
-                }
-            }
-        }
     }
 }

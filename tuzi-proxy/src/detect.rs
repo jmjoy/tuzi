@@ -3,7 +3,8 @@ use http::{Method, Version};
 use nom::{
     branch::alt,
     bytes::streaming::{is_not, tag, take_till, take_while},
-    character::streaming::{char, crlf, one_of},
+    character::is_digit,
+    character::streaming::{char, crlf, digit1, one_of},
     combinator::{map, not, value},
     preceded,
     sequence::{delimited, separated_pair, terminated},
@@ -95,17 +96,19 @@ fn http_method(input: &[u8]) -> IResult<&[u8], Method> {
     ))(input)
 }
 
-pub fn redis(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    tag("*")(input)
+pub fn redis_args_count(input: &[u8]) -> IResult<&[u8], usize> {
+    delimited(
+        tag("*"),
+        map(digit1, |s| str::from_utf8(s).unwrap().parse().unwrap()),
+        crlf,
+    )(input)
 }
 
 fn mysql(input: &[u8]) -> IResult<&[u8], &[u8]> {
     tag([10])(input)
 }
 
-fn detect_http_method(
-    input: ReaderBuffer,
-) -> IResult<ReaderBuffer, Method> {
+fn detect_http_method(input: ReaderBuffer) -> IResult<ReaderBuffer, Method> {
     alt((
         value(Method::GET, tag("GET")),
         value(Method::POST, tag("POST")),
