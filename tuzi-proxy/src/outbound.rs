@@ -1,3 +1,4 @@
+use crate::detect::http_1;
 use crate::{
     detect::detect_http,
     detect::Detection,
@@ -6,13 +7,7 @@ use crate::{
     tcp::{orig_dst_addr, Addrs},
 };
 use std::{cell::RefCell, io::Cursor, sync::Once, time::SystemTime};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek},
-    join,
-    net::{TcpListener, TcpStream},
-    sync::broadcast,
-    try_join,
-};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek}, join, net::{TcpListener, TcpStream}, sync::broadcast, sync::mpsc, try_join};
 use tracing::{debug, error, info, instrument, warn};
 
 struct Context {
@@ -62,6 +57,7 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
     let (mut orig_read, mut orig_write) = orig.split();
 
     let (request_sender, _) = broadcast::channel(16);
+    let (detect_sender, detect_receiver) = mpsc::channel(16);
 
     let client_to_server = async {
         let mut buf = [0; 4096];
@@ -173,6 +169,12 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
         }
     };
 
+    let request_receiver = request_sender.subscribe();
+    let detect_sender = detect_sender.clone();
+    let http_1_detect = async move {
+        http_1::detect(request_receiver, detect_sender).await.unwrap();
+    };
+
     let mut request_receiver = request_sender.subscribe();
     let client_to_server_output = async move {
         loop {
@@ -203,9 +205,10 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
     join!(
         client_to_server,
         server_to_client,
-        http_detect,
-        redis_detect,
+        // http_detect,
+        // redis_detect,
         client_to_server_output,
+        http_1_detect,
     );
 
     let delay = SystemTime::now()

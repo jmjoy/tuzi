@@ -1,3 +1,5 @@
+pub mod http_1;
+
 use crate::stream::ReaderBuffer;
 use http::{Method, Version};
 use nom::{
@@ -14,7 +16,10 @@ use std::str;
 use tokio::io::AsyncRead;
 use tracing::info;
 
-pub struct Detection {}
+pub struct Detection {
+    pub protocol: &'static str,
+    pub is_raw_output: bool,
+}
 
 // impl<R: AsyncRead + Unpin> Detection<R> {
 //     pub fn new(reader_buffer: ReaderBuffer<R>) -> Self {
@@ -43,7 +48,7 @@ pub struct HttpRequestInfo {
 pub fn detect_protocol_with_term(input: &[u8]) -> Option<Protocol> {
     match alt((
         map(http_method, |_| Protocol::HTTP_1),
-        map(redis, |_| Protocol::REDIS),
+        // map(redis, |_| Protocol::REDIS),
         map(mysql, |_| Protocol::MYSQL),
     ))(input)
     {
