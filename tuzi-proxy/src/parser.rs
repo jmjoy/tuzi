@@ -1,8 +1,9 @@
 use nom::{error::ErrorKind, IResult, Needed};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::broadcast::Receiver,
+    sync::{broadcast::Receiver, mpsc},
 };
+use tracing::debug;
 
 pub async fn parse<T>(
     mut content: Vec<u8>,
@@ -48,6 +49,33 @@ pub async fn parse_with_receiver<T>(
         let b = match b {
             Some(b) => b,
             None => return Err(nom::Err::Incomplete(Needed::Unknown)),
+        };
+        content.extend_from_slice(&b);
+    }
+}
+
+pub async fn parse_with_mpsc_receiver<T>(
+    mut content: Vec<u8>,
+    receiver: &mut mpsc::Receiver<Option<Vec<u8>>>,
+    f: impl Fn(&[u8]) -> IResult<&[u8], T>,
+) -> IResult<Vec<u8>, T, (Vec<u8>, ErrorKind)> {
+    loop {
+        match f(&content) {
+            Ok((b, k)) => return Ok((b.to_owned(), k)),
+            Err(e) => match e {
+                nom::Err::Incomplete(_) => {}
+                nom::Err::Error((b, k)) => return Err(nom::Err::Error((b.to_owned(), k))),
+                nom::Err::Failure((b, k)) => return Err(nom::Err::Failure((b.to_owned(), k))),
+            },
+        }
+
+        let b = receiver.recv().await.unwrap();
+        let b = match b {
+            Some(b) => b,
+            None => {
+                debug!("parse_with_mpsc_receiver: empty recv");
+                return Err(nom::Err::Incomplete(Needed::Unknown));
+            }
         };
         content.extend_from_slice(&b);
     }

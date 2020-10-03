@@ -4,7 +4,6 @@ pub use sys::orig_dst_addr;
 
 #[derive(Clone, Debug)]
 pub struct Addrs {
-    pub local: SocketAddr,
     pub peer: SocketAddr,
     pub orig_dst: SocketAddr,
 }

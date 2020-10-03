@@ -1,13 +1,19 @@
-use crate::detect::http_1;
 use crate::{
-    detect::detect_http,
-    detect::Detection,
-    detect::{self, detect_protocol_with_term},
+    detect::{self, detect_http, detect_protocol_with_term, http_1, Detection},
+    parser::{parse_with_mpsc_receiver, parse_with_receiver},
     stream::ReaderBuffer,
     tcp::{orig_dst_addr, Addrs},
 };
-use std::{cell::RefCell, io::Cursor, sync::Once, time::SystemTime};
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek}, join, net::{TcpListener, TcpStream}, sync::broadcast, sync::mpsc, try_join};
+use http_1::respnose_begin;
+use mpsc::error::TryRecvError;
+use std::{cell::RefCell, io::Cursor, net::SocketAddr, sync::Once, time::SystemTime};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek},
+    join,
+    net::{TcpListener, TcpStream},
+    sync::{broadcast, mpsc, oneshot},
+    try_join,
+};
 use tracing::{debug, error, info, instrument, warn};
 
 struct Context {
@@ -36,28 +42,30 @@ pub async fn run() -> anyhow::Result<()> {
         info!("after accept");
 
         tokio::spawn(async move {
+            let peer = socket.peer_addr().unwrap();
             let orig_dst = orig_dst_addr(&socket).unwrap();
-            let addrs = Addrs {
-                local: socket.local_addr().unwrap(),
-                peer: socket.peer_addr().unwrap(),
-                orig_dst,
-            };
-
-            handle(addrs, socket, context).await.unwrap();
+            handle(peer, orig_dst, socket, context).await.unwrap();
         });
     }
 }
 
 #[instrument(name = "outbound::handle", skip(socket, context))]
-async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow::Result<()> {
+async fn handle(
+    peer: SocketAddr,
+    orig_dst: SocketAddr,
+    mut socket: TcpStream,
+    context: Context,
+) -> anyhow::Result<()> {
     info!("before connect to orig_dst");
-    let mut orig = TcpStream::connect(addrs.orig_dst).await.unwrap();
+    let mut orig = TcpStream::connect(orig_dst).await.unwrap();
 
     let (mut socket_read, mut socket_write) = socket.split();
     let (mut orig_read, mut orig_write) = orig.split();
 
     let (request_sender, _) = broadcast::channel(16);
     let (detect_sender, detect_receiver) = mpsc::channel(16);
+
+    let (mut protocol_sender, mut protocol_receiver) = mpsc::channel(16);
 
     let client_to_server = async {
         let mut buf = [0; 4096];
@@ -172,7 +180,11 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
     let request_receiver = request_sender.subscribe();
     let detect_sender = detect_sender.clone();
     let http_1_detect = async move {
-        http_1::detect(request_receiver, detect_sender).await.unwrap();
+        if let Err(e) = http_1::detect(request_receiver, detect_sender).await {
+            warn!("is not http protocol");
+        } else {
+            protocol_sender.send("http_1").await.unwrap();
+        }
     };
 
     let mut request_receiver = request_sender.subscribe();
@@ -194,21 +206,66 @@ async fn handle(addrs: Addrs, mut socket: TcpStream, context: Context) -> anyhow
         orig_write.shutdown().await.unwrap();
     };
 
-    let server_to_client = async {
-        let copied = tokio::io::copy(&mut orig_read, &mut socket_write)
-            .await
-            .unwrap();
-        info!(copied);
+    let (mut response_sender, mut response_receiver) = mpsc::channel(16);
+    let server_to_client = async move {
+        let mut buf = [0; 4096];
+        loop {
+            let n = orig_read.read(&mut buf).await.unwrap();
+            if n == 0 {
+                let _ = response_sender.send(None).await;
+                break;
+            } else {
+                let n = socket_write.write(&buf[..n]).await.unwrap();
+                if n == 0 {
+                    panic!("Write zero");
+                }
+                let _ = response_sender.send(Some(Vec::from(&buf[..n]))).await;
+            }
+        }
         socket_write.shutdown().await.unwrap();
+    };
+
+    let server_to_client_analyzer = async move {
+        let mut content = Vec::new();
+
+        let protocol = loop {
+            let buf = response_receiver.recv().await.unwrap();
+            let buf = match buf {
+                Some(buf) => buf,
+                None => break None,
+            };
+            content.extend_from_slice(&buf);
+
+            match protocol_receiver.try_recv() {
+                Ok(protocol) => break Some(protocol),
+                Err(TryRecvError::Empty) => {}
+                Err(e @ TryRecvError::Closed) => panic!(e),
+            }
+        };
+
+        if let Some(protocol) = protocol {
+            match protocol {
+                "http_1" => {
+                    match parse_with_mpsc_receiver(content, &mut response_receiver, respnose_begin)
+                        .await
+                    {
+                        Ok((_, begin)) => info!(?begin, "http response"),
+                        Err(_) => error!("http_1 parse failed"),
+                    }
+                }
+                _ => {}
+            }
+        }
     };
 
     join!(
         client_to_server,
-        server_to_client,
         // http_detect,
         // redis_detect,
         client_to_server_output,
         http_1_detect,
+        server_to_client,
+        server_to_client_analyzer,
     );
 
     let delay = SystemTime::now()

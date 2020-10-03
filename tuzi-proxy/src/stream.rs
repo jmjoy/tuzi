@@ -1,8 +1,16 @@
 use crate::error::TuZiResult;
 use io::AsyncReadExt;
 use nom::{Compare, CompareResult, InputTake};
-use std::{cell::RefCell, io::Write, rc::Rc, sync::Arc, sync::RwLock};
-use tokio::{io::{self, AsyncRead, AsyncWrite, AsyncWriteExt}, sync::broadcast};
+use std::{
+    cell::RefCell,
+    io::Write,
+    rc::Rc,
+    sync::{Arc, RwLock},
+};
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
+    sync::broadcast,
+};
 
 #[derive(Clone)]
 pub enum TakeDirection {
@@ -146,7 +154,5 @@ mod tests {
     // }
 
     #[test]
-    fn test_nom_streaming() {
-
-    }
+    fn test_nom_streaming() {}
 }

@@ -5,8 +5,10 @@ use http::{Method, Version};
 use nom::{
     branch::alt,
     bytes::streaming::{is_not, tag, take_till, take_while},
-    character::is_digit,
-    character::streaming::{char, crlf, digit1, one_of},
+    character::{
+        is_digit,
+        streaming::{char, crlf, digit1, one_of},
+    },
     combinator::{map, not, value},
     preceded,
     sequence::{delimited, separated_pair, terminated},

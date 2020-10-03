@@ -1,19 +1,23 @@
 use crate::parser::parse_with_receiver;
 use http::{Method, Version};
 use indexmap::IndexMap;
-use nom::{branch::alt, combinator::value, sequence::delimited, sequence::tuple, IResult};
 use nom::{
+    branch::alt,
     bytes::streaming::{is_not, tag, take_till, take_while},
-    combinator::map,
-};
-use nom::{
-    character::streaming::{char, crlf, digit1, one_of},
-    sequence::terminated,
+    character::{
+        is_digit,
+        streaming::{char, crlf, digit1, one_of},
+    },
+    combinator::{map, value},
+    sequence::{delimited, preceded, terminated, tuple},
+    IResult,
 };
 use std::collections::HashMap;
-use tokio::sync::{broadcast::{self, Receiver}, mpsc};
-use tracing::info;
-use tracing::{instrument, warn};
+use tokio::sync::{
+    broadcast::{self, Receiver},
+    mpsc,
+};
+use tracing::{info, instrument, warn};
 
 use super::Detection;
 
@@ -24,7 +28,10 @@ pub struct RequestBegin {
     version: Version,
 }
 
-pub async fn detect(mut receiver: broadcast::Receiver<Option<Vec<u8>>>, mut detect_sender: mpsc::Sender<Detection>) -> anyhow::Result<()> {
+pub async fn detect(
+    mut receiver: broadcast::Receiver<Option<Vec<u8>>>,
+    mut detect_sender: mpsc::Sender<Detection>,
+) -> anyhow::Result<()> {
     let content = Vec::new();
     let (mut content, info) = parse_with_receiver(content, &mut receiver, begin).await?;
 
@@ -54,18 +61,14 @@ pub async fn detect(mut receiver: broadcast::Receiver<Option<Vec<u8>>>, mut dete
 fn begin(input: &[u8]) -> IResult<&[u8], RequestBegin> {
     let (input, method) = method(input)?;
     let (input, uri) = delimited(char(' '), is_not(" \r\n"), char(' '))(input)?;
-    let (input, version) = delimited(tag("HTTP/1."), one_of("01"), crlf)(input)?;
+    let (input, version) = terminated(version, crlf)(input)?;
 
     Ok((
         input,
         RequestBegin {
             method,
             uri: String::from_utf8(uri.to_owned()).unwrap(),
-            version: match version {
-                '0' => Version::HTTP_10,
-                '1' => Version::HTTP_11,
-                _ => unreachable!(),
-            },
+            version,
         },
     ))
 }
@@ -80,6 +83,17 @@ fn method(input: &[u8]) -> IResult<&[u8], Method> {
     ))(input)
 }
 
+fn version(input: &[u8]) -> IResult<&[u8], Version> {
+    preceded(
+        tag("HTTP/1."),
+        map(one_of("01"), |v| match v {
+            '0' => Version::HTTP_10,
+            '1' => Version::HTTP_11,
+            _ => unreachable!(),
+        }),
+    )(input)
+}
+
 fn header(input: &[u8]) -> IResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     let (input, kv) = alt((
         map(crlf, |_| None),
@@ -90,4 +104,16 @@ fn header(input: &[u8]) -> IResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     ))(input)?;
 
     Ok((input, kv))
+}
+
+pub fn respnose_begin(input: &[u8]) -> IResult<&[u8], String> {
+    let (input, version) = terminated(version, char(' '))(input)?;
+    let (input, code) = terminated(
+        map(take_while(is_digit), |s: &[u8]| {
+            String::from_utf8(s.to_owned()).unwrap()
+        }),
+        char(' '),
+    )(input)?;
+    let (input, _) = terminated(is_not("\r\n"), crlf)(input)?;
+    Ok((input, format!("version: {:?}, code: {}", version, code)))
 }
