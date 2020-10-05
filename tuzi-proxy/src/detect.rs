@@ -18,9 +18,10 @@ use std::str;
 use tokio::io::AsyncRead;
 use tracing::info;
 
+#[derive(Debug)]
 pub struct Detection {
     pub protocol: &'static str,
-    pub is_raw_output: bool,
+    pub data: Option<Vec<u8>>,
 }
 
 // impl<R: AsyncRead + Unpin> Detection<R> {

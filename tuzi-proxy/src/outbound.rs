@@ -6,7 +6,9 @@ use crate::{
 };
 use http_1::respnose_begin;
 use mpsc::error::TryRecvError;
-use std::{cell::RefCell, io::Cursor, net::SocketAddr, sync::Once, time::SystemTime};
+use std::{
+    cell::RefCell, collections::HashMap, io::Cursor, net::SocketAddr, sync::Once, time::SystemTime,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek},
     join,
@@ -63,28 +65,17 @@ async fn handle(
     let (mut orig_read, mut orig_write) = orig.split();
 
     let (request_sender, _) = broadcast::channel(16);
-    let (detect_sender, detect_receiver) = mpsc::channel(16);
+    let (request_protocol_sender, mut request_protocol_receiver): (mpsc::Sender<Detection>, _) =
+        mpsc::channel(16);
+    let (mut response_protocol_sender, mut response_protocol_receiver) = mpsc::channel(16);
 
-    let (mut protocol_sender, mut protocol_receiver) = mpsc::channel(16);
+    // TODO 和 request_protocol_sender结合在一起。
+    let mut detection_count: usize = 0;
+    detection_count += 1;
 
     let client_to_server = async {
         let mut buf = [0; 4096];
         let mut copied = 0;
-
-        // let once = Once::new();
-
-        // let rb = ReaderBuffer::new();
-
-        // loop {
-        //     let reader_buffer = ReaderBuffer::new(&buffer);
-        //     buffer.extend_from_slice(b"fuck");
-        //     reader_buffer.take(1);
-        // }
-
-        // let protocol = detection.detect_protocol();
-        // info!(?protocol, "detect protocol");
-
-        // detection.reader_buffer().write_to(&mut orig_write).await.unwrap();
 
         loop {
             let n = socket_read.read(&mut buf).await.unwrap();
@@ -95,34 +86,46 @@ async fn handle(
             }
             copied += n;
 
-            let buf = (&buf[..n]).to_owned();
+            let buf0 = (&buf[..n]).to_owned();
             debug!("request_sender {:?}", Some(buf.len()));
-            request_sender.send(Some(buf)).unwrap();
-
-            // once.call_once(|| match detect_protocol(&buf[..n], &mut new_buf) {
-            //     Some(info) => info!(?info, "protocol: http"),
-            //     None => info!("protocol: unknown"),
-            // });
-
-            // if term == 0 {
-            //     let protocol = detect_protocol_with_term(&buf);
-            //     info!(?protocol, "detect protocol");
-            // }
-
-            // let write_buf = if new_buf.is_empty() {
-            //     &buf[..n]
-            // } else {
-            //     &new_buf[..]
-            // };
-            // let n = orig_write.write(write_buf).await.unwrap();
-            // if n == 0 {
-            //     panic!("Write zero");
-            // }
-
-            // new_buf.clear();
-
-            // term += 1;
+            request_sender.send(Some(buf0)).unwrap();
         }
+    };
+
+    let client_to_server_output = async move {
+        let mut protocol = None;
+        loop {
+            let detection = request_protocol_receiver.recv().await.unwrap();
+
+            match protocol {
+                Some(protocol) => {
+                    if protocol != detection.protocol {
+                        panic!("multi protocol detection!");
+                    }
+                }
+                None => {
+                    protocol = Some(detection.protocol);
+                }
+            }
+
+            match detection.data {
+                Some(recv_content) => {
+                    debug!("recv_content size: {}", recv_content.len());
+                    if recv_content.len() != 0 {
+                        let n = orig_write.write(&recv_content).await.unwrap();
+                        if n == 0 {
+                            panic!("Write zero");
+                        }
+                    }
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        // info!(copied);
+        orig_write.shutdown().await.unwrap();
     };
 
     let mut request_receiver = request_sender.subscribe();
@@ -178,32 +181,13 @@ async fn handle(
     };
 
     let request_receiver = request_sender.subscribe();
-    let detect_sender = detect_sender.clone();
+    let request_protocol_sender = request_protocol_sender.clone();
     let http_1_detect = async move {
-        if let Err(e) = http_1::detect(request_receiver, detect_sender).await {
+        if let Err(e) = http_1::detect(request_receiver, request_protocol_sender).await {
             warn!("is not http protocol");
         } else {
-            protocol_sender.send("http_1").await.unwrap();
+            response_protocol_sender.send("http_1").await.unwrap();
         }
-    };
-
-    let mut request_receiver = request_sender.subscribe();
-    let client_to_server_output = async move {
-        loop {
-            let request = request_receiver.recv().await.unwrap();
-            debug!("receiver output size {:?}", request.as_ref().map(Vec::len));
-            let request = match request {
-                Some(input) => input,
-                None => break,
-            };
-            let n = orig_write.write(&request).await.unwrap();
-            if n == 0 {
-                panic!("Write zero");
-            }
-        }
-
-        // info!(copied);
-        orig_write.shutdown().await.unwrap();
     };
 
     let (mut response_sender, mut response_receiver) = mpsc::channel(16);
@@ -236,7 +220,7 @@ async fn handle(
             };
             content.extend_from_slice(&buf);
 
-            match protocol_receiver.try_recv() {
+            match response_protocol_receiver.try_recv() {
                 Ok(protocol) => break Some(protocol),
                 Err(TryRecvError::Empty) => {}
                 Err(e @ TryRecvError::Closed) => panic!(e),
@@ -260,8 +244,6 @@ async fn handle(
 
     join!(
         client_to_server,
-        // http_detect,
-        // redis_detect,
         client_to_server_output,
         http_1_detect,
         server_to_client,
