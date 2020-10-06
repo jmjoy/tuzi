@@ -1,7 +1,6 @@
 use crate::{
     detect::{self, detect_http, detect_protocol_with_term, http_1, Detection},
-    parser::{parse_with_mpsc_receiver, parse_with_receiver},
-    stream::ReaderBuffer,
+    parser::Parser,
     tcp::{orig_dst_addr, Addrs},
 };
 use http_1::respnose_begin;
@@ -125,7 +124,7 @@ async fn handle(
     };
 
     let mut request_receiver = request_sender.subscribe();
-    let http_detect = async move {
+    let _http_detect = async move {
         let mut header = Vec::new();
 
         let info = loop {
@@ -154,7 +153,7 @@ async fn handle(
     };
 
     let mut request_receiver = request_sender.subscribe();
-    let redis_detect = async move {
+    let _redis_detect = async move {
         let input = request_receiver.recv().await.unwrap();
         let input = match input {
             Some(input) => input,
@@ -179,7 +178,7 @@ async fn handle(
     let request_receiver = request_sender.subscribe();
     let request_protocol_sender = request_protocol_sender.clone();
     let http_1_detect = async move {
-        if let Err(e) = http_1::detect(request_receiver, request_protocol_sender).await {
+        if let Err(_e) = http_1::detect(request_receiver, request_protocol_sender).await {
             warn!("is not http protocol");
         } else {
             response_protocol_sender.send("http_1").await.unwrap();
@@ -226,10 +225,9 @@ async fn handle(
         if let Some(protocol) = protocol {
             match protocol {
                 "http_1" => {
-                    match parse_with_mpsc_receiver(content, &mut response_receiver, respnose_begin)
-                        .await
-                    {
-                        Ok((_, begin)) => info!(?begin, "http response"),
+                    let mut parser = Parser::new(content, &mut response_receiver);
+                    match parser.parse_and_recv(respnose_begin).await {
+                        Ok(begin) => info!(?begin, "http response"),
                         Err(_) => error!("http_1 parse failed"),
                     }
                 }

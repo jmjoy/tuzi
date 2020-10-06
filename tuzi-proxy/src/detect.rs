@@ -1,6 +1,5 @@
 pub mod http_1;
 
-use crate::stream::ReaderBuffer;
 use http::{Method, Version};
 use nom::{
     branch::alt,
@@ -15,7 +14,7 @@ use nom::{
     IResult,
 };
 use std::str;
-use tokio::io::AsyncRead;
+
 use tracing::info;
 
 #[derive(Debug)]
@@ -114,16 +113,6 @@ pub fn redis_args_count(input: &[u8]) -> IResult<&[u8], usize> {
 
 fn mysql(input: &[u8]) -> IResult<&[u8], &[u8]> {
     tag([10])(input)
-}
-
-fn detect_http_method(input: ReaderBuffer) -> IResult<ReaderBuffer, Method> {
-    alt((
-        value(Method::GET, tag("GET")),
-        value(Method::POST, tag("POST")),
-        value(Method::PUT, tag("PUT")),
-        value(Method::DELETE, tag("DELETE")),
-        value(Method::HEAD, tag("HEAD")),
-    ))(input)
 }
 
 #[cfg(test)]

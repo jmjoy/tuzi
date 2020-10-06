@@ -1,10 +1,12 @@
-use nom::{error::ErrorKind, IResult, Needed};
-use std::future::Future;
-use tokio::{sync::{broadcast::{self}, mpsc}};
-use tracing::debug;
-use async_trait::async_trait;
+use crate::error::{ITuziResult, TuziError, TuziResult};
 use anyhow::anyhow;
-use crate::error::{TuziError, TuziResult};
+use async_trait::async_trait;
+use nom::{error::ErrorKind, IResult, Needed};
+
+use tokio::sync::{
+    broadcast::{self},
+    mpsc,
+};
 
 #[async_trait]
 pub trait Receiveable<T> {
@@ -32,8 +34,55 @@ impl<T: Send + Clone> Receiveable<T> for broadcast::Receiver<T> {
     }
 }
 
-pub struct Parser {
-    content: Vec<u8>,
+pub struct Parser<'a, R: Receiveable<Option<Vec<u8>>>> {
+    parse_content: Vec<u8>,
+    recv_content: Vec<u8>,
+    receiver: &'a mut R,
+}
+
+impl<'a, R: Receiveable<Option<Vec<u8>>>> Parser<'a, R> {
+    pub fn new(init_parse_content: Vec<u8>, receiver: &'a mut R) -> Self {
+        Self {
+            parse_content: init_parse_content,
+            recv_content: Vec::new(),
+            receiver,
+        }
+    }
+
+    pub fn recv_content_ref(&self) -> &[u8] {
+        &self.recv_content
+    }
+
+    pub fn clear_recv_content(&mut self) {
+        self.recv_content.clear()
+    }
+
+    pub async fn parse_and_recv<T>(
+        &mut self,
+        f: impl Fn(&[u8]) -> ITuziResult<&[u8], T>,
+    ) -> TuziResult<T> {
+        loop {
+            match f(&self.parse_content) {
+                Ok((b, t)) => {
+                    self.parse_content = b.to_owned();
+                    return Ok(t);
+                }
+                Err(e) => match e {
+                    nom::Err::Incomplete(_) => {}
+                    nom::Err::Error(e) => return Err(e),
+                    nom::Err::Failure(e) => return Err(e),
+                },
+            }
+            let b = self.receiver.receive().await?;
+            let b = match b {
+                Some(b) => b,
+                None => return Err(TuziError::ParseIncomplete),
+            };
+
+            self.parse_content.extend_from_slice(&b);
+            self.recv_content.extend_from_slice(&b);
+        }
+    }
 }
 
 pub async fn parse_and_recv<T>(
@@ -51,7 +100,7 @@ pub async fn parse_and_recv<T>(
                 nom::Err::Failure((b, k)) => return Err(nom::Err::Failure((b.to_owned(), k))),
             },
         }
-        let b = receiver.recv().await.unwrap();
+        let b = receiver.receive().await.unwrap();
         let b = match b {
             Some(b) => b,
             None => return Err(nom::Err::Incomplete(Needed::Unknown)),

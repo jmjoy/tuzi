@@ -1,4 +1,7 @@
-use crate::parser::parse_with_receiver;
+use crate::{
+    error::{ITuziResult, TuziResult},
+    parser::Parser,
+};
 use http::{Method, Version};
 use indexmap::IndexMap;
 use nom::{
@@ -12,12 +15,12 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
-use std::collections::HashMap;
+
 use tokio::sync::{
-    broadcast::{self, Receiver},
+    broadcast::{self},
     mpsc,
 };
-use tracing::{info, instrument, warn};
+use tracing::info;
 
 use super::Detection;
 
@@ -31,22 +34,14 @@ pub struct RequestBegin {
 pub async fn detect(
     mut receiver: broadcast::Receiver<Option<Vec<u8>>>,
     mut request_protocol_sender: mpsc::Sender<Detection>,
-) -> anyhow::Result<()> {
-    let mut header_content = Vec::new();
+) -> TuziResult<()> {
+    let mut parser = Parser::new(Vec::new(), &mut receiver);
 
-    let content = Vec::new();
-    let (mut content, recv_content, info) =
-        parse_with_receiver(content, &mut receiver, begin).await?;
-
-    header_content.extend_from_slice(&recv_content);
+    let info = parser.parse_and_recv(begin).await?;
 
     let mut headers = IndexMap::new();
     loop {
-        let (new_content, recv_content, item) =
-            parse_with_receiver(content, &mut receiver, header).await?;
-
-        header_content.extend_from_slice(&recv_content);
-
+        let item = parser.parse_and_recv(header).await?;
         match item {
             Some((key, value)) => {
                 headers
@@ -56,16 +51,15 @@ pub async fn detect(
             }
             None => break,
         }
-        content = new_content;
     }
 
     info!(?info, ?headers, "detect http");
 
-    if !header_content.is_empty() {
+    if !parser.recv_content_ref().is_empty() {
         request_protocol_sender
             .send(Detection {
                 protocol: "http_1",
-                data: Some(header_content),
+                data: Some(parser.recv_content_ref().to_owned()),
             })
             .await
             .unwrap();
@@ -99,7 +93,7 @@ pub async fn detect(
     Ok(())
 }
 
-fn begin(input: &[u8]) -> IResult<&[u8], RequestBegin> {
+fn begin(input: &[u8]) -> ITuziResult<&[u8], RequestBegin> {
     let (input, method) = method(input)?;
     let (input, uri) = delimited(char(' '), is_not(" \r\n"), char(' '))(input)?;
     let (input, version) = terminated(version, crlf)(input)?;
@@ -114,7 +108,7 @@ fn begin(input: &[u8]) -> IResult<&[u8], RequestBegin> {
     ))
 }
 
-fn method(input: &[u8]) -> IResult<&[u8], Method> {
+fn method(input: &[u8]) -> ITuziResult<&[u8], Method> {
     alt((
         value(Method::GET, tag("GET")),
         value(Method::POST, tag("POST")),
@@ -124,7 +118,7 @@ fn method(input: &[u8]) -> IResult<&[u8], Method> {
     ))(input)
 }
 
-fn version(input: &[u8]) -> IResult<&[u8], Version> {
+fn version(input: &[u8]) -> ITuziResult<&[u8], Version> {
     preceded(
         tag("HTTP/1."),
         map(one_of("01"), |v| match v {
@@ -135,7 +129,7 @@ fn version(input: &[u8]) -> IResult<&[u8], Version> {
     )(input)
 }
 
-fn header(input: &[u8]) -> IResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
+fn header(input: &[u8]) -> ITuziResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     let (input, kv) = alt((
         map(crlf, |_| None),
         map(
@@ -147,7 +141,7 @@ fn header(input: &[u8]) -> IResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     Ok((input, kv))
 }
 
-pub fn respnose_begin(input: &[u8]) -> IResult<&[u8], String> {
+pub fn respnose_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
     let (input, version) = terminated(version, char(' '))(input)?;
     let (input, code) = terminated(
         map(take_while(is_digit), |s: &[u8]| {

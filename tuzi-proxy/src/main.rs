@@ -4,14 +4,13 @@ mod error;
 mod inbound;
 mod outbound;
 mod parser;
-mod stream;
 mod tcp;
 mod util;
 
-use error::TuZiResult;
+use error::TuziResult;
 
 #[tokio::main]
-async fn main() -> TuZiResult<()> {
+async fn main() -> TuziResult<()> {
     app::init_tracing();
     app::run().await?;
     Ok(())
