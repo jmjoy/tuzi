@@ -1,5 +1,4 @@
 use std::io;
-
 use nom::error::{ErrorKind, ParseError};
 
 pub type TuziResult<T> = Result<T, TuziError>;
@@ -33,13 +32,3 @@ impl ParseError<&[u8]> for TuziError {
         other
     }
 }
-
-// impl Into<nom::Err<TuziError>> for nom::Err<(&[u8], ErrorKind)> {
-//     fn into(self) -> nom::Err<TuziError> {
-//         match self {
-//             i @ nom::Err::Incomplete(_) => i,
-//             nom::Err::Error((input, kind)) => nom::Err::Error(TuziError::from_error_kind(input, kind)),
-//             nom::Err::Failure((input, kind)) => nom::Err::Failure(TuziError::from_error_kind(input, kind)),
-//         }
-//     }
-// }

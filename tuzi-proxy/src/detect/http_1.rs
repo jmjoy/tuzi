@@ -1,6 +1,6 @@
 use crate::{
     error::{ITuziResult, TuziResult},
-    parser::Parser,
+    parse::Parser,
 };
 use http::{Method, Version};
 use indexmap::IndexMap;

@@ -1,6 +1,6 @@
 use crate::{
     detect::{self, detect_http, detect_protocol_with_term, http_1, Detection},
-    parser::Parser,
+    parse::Parser,
     tcp::{orig_dst_addr, Addrs},
 };
 use http_1::respnose_begin;
@@ -29,18 +29,18 @@ impl Context {
     }
 }
 
-#[instrument(name = "outbound::run")]
+#[instrument(name = "outbound:run")]
 pub async fn run() -> anyhow::Result<()> {
     let mut listener = TcpListener::bind("127.0.0.1:4140").await?;
 
-    info!("after bind");
+    debug!("after bind");
 
     loop {
         let (socket, _) = listener.accept().await?;
 
-        let context = Context::new();
+        debug!("after accept");
 
-        info!("after accept");
+        let context = Context::new();
 
         tokio::spawn(async move {
             let peer = socket.peer_addr().unwrap();
@@ -50,15 +50,15 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-#[instrument(name = "outbound::handle", skip(socket, context))]
+#[instrument(name = "outbound:handle", skip(socket, context))]
 async fn handle(
     peer: SocketAddr,
     orig_dst: SocketAddr,
     mut socket: TcpStream,
     context: Context,
 ) -> anyhow::Result<()> {
-    info!("before connect to orig_dst");
     let mut orig = TcpStream::connect(orig_dst).await.unwrap();
+    debug!("after connect to orig_dst");
 
     let (mut socket_read, mut socket_write) = socket.split();
     let (mut orig_read, mut orig_write) = orig.split();

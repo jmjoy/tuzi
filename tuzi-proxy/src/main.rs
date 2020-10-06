@@ -3,7 +3,7 @@ mod detect;
 mod error;
 mod inbound;
 mod outbound;
-mod parser;
+mod parse;
 mod tcp;
 mod util;
 

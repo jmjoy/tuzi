@@ -34,6 +34,10 @@ impl<T: Send + Clone> Receiveable<T> for broadcast::Receiver<T> {
     }
 }
 
+pub struct Delivery {
+
+}
+
 pub struct Parser<'a, R: Receiveable<Option<Vec<u8>>>> {
     parse_content: Vec<u8>,
     recv_content: Vec<u8>,

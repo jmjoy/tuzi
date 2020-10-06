@@ -1,12 +1,4 @@
-use std::net::SocketAddr;
-
 pub use sys::orig_dst_addr;
-
-#[derive(Clone, Debug)]
-pub struct Addrs {
-    pub peer: SocketAddr,
-    pub orig_dst: SocketAddr,
-}
 
 mod sys {
     use std::{io, net::SocketAddr};
