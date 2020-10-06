@@ -69,10 +69,6 @@ async fn handle(
         mpsc::channel(16);
     let (mut response_protocol_sender, mut response_protocol_receiver) = mpsc::channel(16);
 
-    // TODO 和 request_protocol_sender结合在一起。
-    let mut detection_count: usize = 0;
-    detection_count += 1;
-
     let client_to_server = async {
         let mut buf = [0; 4096];
         let mut copied = 0;

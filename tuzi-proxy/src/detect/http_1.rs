@@ -32,30 +32,20 @@ pub async fn detect(
     mut receiver: broadcast::Receiver<Option<Vec<u8>>>,
     mut request_protocol_sender: mpsc::Sender<Detection>,
 ) -> anyhow::Result<()> {
+    let mut header_content = Vec::new();
+
     let content = Vec::new();
     let (mut content, recv_content, info) =
         parse_with_receiver(content, &mut receiver, begin).await?;
 
-    request_protocol_sender
-        .send(Detection {
-            protocol: "http_1",
-            data: Some(recv_content),
-        })
-        .await
-        .unwrap();
+    header_content.extend_from_slice(&recv_content);
 
     let mut headers = IndexMap::new();
     loop {
         let (new_content, recv_content, item) =
             parse_with_receiver(content, &mut receiver, header).await?;
 
-        request_protocol_sender
-            .send(Detection {
-                protocol: "http_1",
-                data: Some(recv_content),
-            })
-            .await
-            .unwrap();
+        header_content.extend_from_slice(&recv_content);
 
         match item {
             Some((key, value)) => {
@@ -70,6 +60,16 @@ pub async fn detect(
     }
 
     info!(?info, ?headers, "detect http");
+
+    if !header_content.is_empty() {
+        request_protocol_sender
+            .send(Detection {
+                protocol: "http_1",
+                data: Some(header_content),
+            })
+            .await
+            .unwrap();
+    }
 
     loop {
         let recv_content = receiver.recv().await.unwrap();
