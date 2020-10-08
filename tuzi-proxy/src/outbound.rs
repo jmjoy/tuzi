@@ -1,9 +1,9 @@
-use crate::{
-    detect::{self, detect_http, detect_protocol_with_term, http_1, Detection},
-    parse::Parser,
-    tcp::{orig_dst_addr, Addrs},
+use crate::parse::{delivery, Protocol, RequestParsedContent, http1};
+use crate::parse::http1::respnose_begin;
+use crate::parse::{
+    RequestParsedData, RequestParserDelivery, RequestRawDelivery, RequestTransportDelivery,
 };
-use http_1::respnose_begin;
+use crate::{parse::Parser, tcp::orig_dst_addr};
 use mpsc::error::TryRecvError;
 use std::{
     cell::RefCell, collections::HashMap, io::Cursor, net::SocketAddr, sync::Once, time::SystemTime,
@@ -16,6 +16,7 @@ use tokio::{
     try_join,
 };
 use tracing::{debug, error, info, instrument, warn};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 struct Context {
     start_time: SystemTime,
@@ -60,189 +61,81 @@ async fn handle(
     let mut orig = TcpStream::connect(orig_dst).await.unwrap();
     debug!("after connect to orig_dst");
 
-    let (mut socket_read, mut socket_write) = socket.split();
-    let (mut orig_read, mut orig_write) = orig.split();
+    let (mut socket_read, mut socket_write) = socket.into_split();
+    let (mut orig_read, mut orig_write) = orig.into_split();
 
-    let (request_sender, _) = broadcast::channel(16);
-    let (request_protocol_sender, mut request_protocol_receiver): (mpsc::Sender<Detection>, _) =
-        mpsc::channel(16);
-    let (mut response_protocol_sender, mut response_protocol_receiver) = mpsc::channel(16);
+    let (
+        request_raw_delivery,
+        mut request_parsed_deliveries,
+        request_transport_delivery,
+        response_protocol_delivery,
+    ) = delivery(2);
 
-    let client_to_server = async {
-        let mut buf = [0; 4096];
-        let mut copied = 0;
+    let mut handles = Vec::new();
+    handles.push(tokio::spawn(client_to_proxy(socket_read, request_raw_delivery)));
+    handles.push(tokio::spawn(request_raw_transport(request_parsed_deliveries.pop().unwrap())));
+    handles.push(tokio::spawn(async move {
+        http1::parse(request_parsed_deliveries.pop().unwrap()).unwrap();
+    }));
+    handles.push(tokio::spawn(proxy_to_server(orig_write, request_transport_delivery)));
+    handles.push(tokio::spawn(async move {
+        tokio::io::copy(&mut orig_read, &mut socket_write).await.unwrap();
+    }));
 
-        loop {
-            let n = socket_read.read(&mut buf).await.unwrap();
-            if n == 0 {
-                debug!("request_sender None");
-                request_sender.send(None).unwrap();
-                break;
-            }
-            copied += n;
+    for handle in handles {
+        handle.await.unwrap();
+    }
 
-            let buf0 = (&buf[..n]).to_owned();
-            debug!("request_sender {:?}", Some(buf.len()));
-            request_sender.send(Some(buf0)).unwrap();
-        }
-    };
-
-    let client_to_server_output = async move {
-        let mut protocol = None;
-        loop {
-            let detection = request_protocol_receiver.recv().await.unwrap();
-
-            match protocol {
-                Some(protocol) => {
-                    if protocol != detection.protocol {
-                        panic!("multi protocol detection!");
-                    }
-                }
-                None => {
-                    protocol = Some(detection.protocol);
-                }
-            }
-
-            match detection.data {
-                Some(recv_content) => {
-                    debug!("recv_content size: {}", recv_content.len());
-                    if recv_content.len() != 0 {
-                        let n = orig_write.write(&recv_content).await.unwrap();
-                        if n == 0 {
-                            panic!("Write zero");
-                        }
-                    }
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-
-        // info!(copied);
-        orig_write.shutdown().await.unwrap();
-    };
-
-    let mut request_receiver = request_sender.subscribe();
-    let _http_detect = async move {
-        let mut header = Vec::new();
-
-        let info = loop {
-            let input = request_receiver.recv().await.unwrap();
-            let input = match input {
-                Some(input) => input,
-                None => break None,
-            };
-            header.extend_from_slice(&input);
-
-            match detect::http(&header) {
-                Ok((_, info)) => break Some(info),
-                Err(e) => match e {
-                    nom::Err::Incomplete(..) => {}
-                    nom::Err::Error((_, kind)) => {
-                        warn!(?kind, "detect http");
-                    }
-                    nom::Err::Failure((_, kind)) => {
-                        error!(?kind, "detect http");
-                    }
-                },
-            }
-        };
-
-        info!(?info, "detct http");
-    };
-
-    let mut request_receiver = request_sender.subscribe();
-    let _redis_detect = async move {
-        let input = request_receiver.recv().await.unwrap();
-        let input = match input {
-            Some(input) => input,
-            None => return,
-        };
-        match detect::redis_args_count(&input) {
-            Ok((remain, _)) => {
-                info!("detect redis: {}", std::str::from_utf8(remain).unwrap());
-            }
-            Err(e) => match e {
-                nom::Err::Incomplete(..) => {}
-                nom::Err::Error((_, kind)) => {
-                    warn!(?kind, "detect redis");
-                }
-                nom::Err::Failure((_, kind)) => {
-                    error!(?kind, "detect redis");
-                }
-            },
-        }
-    };
-
-    let request_receiver = request_sender.subscribe();
-    let request_protocol_sender = request_protocol_sender.clone();
-    let http_1_detect = async move {
-        if let Err(_e) = http_1::detect(request_receiver, request_protocol_sender).await {
-            warn!("is not http protocol");
-        } else {
-            response_protocol_sender.send("http_1").await.unwrap();
-        }
-    };
-
-    let (mut response_sender, mut response_receiver) = mpsc::channel(16);
-    let server_to_client = async move {
-        let mut buf = [0; 4096];
-        loop {
-            let n = orig_read.read(&mut buf).await.unwrap();
-            if n == 0 {
-                let _ = response_sender.send(None).await;
-                break;
-            } else {
-                let n = socket_write.write(&buf[..n]).await.unwrap();
-                if n == 0 {
-                    panic!("Write zero");
-                }
-                let _ = response_sender.send(Some(Vec::from(&buf[..n]))).await;
-            }
-        }
-        socket_write.shutdown().await.unwrap();
-    };
-
-    let server_to_client_analyzer = async move {
-        let mut content = Vec::new();
-
-        let protocol = loop {
-            let buf = response_receiver.recv().await.unwrap();
-            let buf = match buf {
-                Some(buf) => buf,
-                None => break None,
-            };
-            content.extend_from_slice(&buf);
-
-            match response_protocol_receiver.try_recv() {
-                Ok(protocol) => break Some(protocol),
-                Err(TryRecvError::Empty) => {}
-                Err(e @ TryRecvError::Closed) => panic!(e),
-            }
-        };
-
-        if let Some(protocol) = protocol {
-            match protocol {
-                "http_1" => {
-                    let mut parser = Parser::new(content, &mut response_receiver);
-                    match parser.parse_and_recv(respnose_begin).await {
-                        Ok(begin) => info!(?begin, "http response"),
-                        Err(_) => error!("http_1 parse failed"),
-                    }
-                }
-                _ => {}
-            }
-        }
-    };
-
-    join!(
-        client_to_server,
-        client_to_server_output,
-        http_1_detect,
-        server_to_client,
-        server_to_client_analyzer,
-    );
+    // let (mut response_sender, mut response_receiver) = mpsc::channel(16);
+    // let server_to_client = async move {
+    //     let mut buf = [0; 4096];
+    //     loop {
+    //         let n = orig_read.read(&mut buf).await.unwrap();
+    //         if n == 0 {
+    //             let _ = response_sender.send(None).await;
+    //             break;
+    //         } else {
+    //             let n = socket_write.write(&buf[..n]).await.unwrap();
+    //             if n == 0 {
+    //                 panic!("Write zero");
+    //             }
+    //             let _ = response_sender.send(Some(Vec::from(&buf[..n]))).await;
+    //         }
+    //     }
+    //     socket_write.shutdown().await.unwrap();
+    // };
+    //
+    // let server_to_client_analyzer = async move {
+    //     let mut content = Vec::new();
+    //
+    //     let protocol = loop {
+    //         let buf = response_receiver.recv().await.unwrap();
+    //         let buf = match buf {
+    //             Some(buf) => buf,
+    //             None => break None,
+    //         };
+    //         content.extend_from_slice(&buf);
+    //
+    //         match response_protocol_receiver.try_recv() {
+    //             Ok(protocol) => break Some(protocol),
+    //             Err(TryRecvError::Empty) => {}
+    //             Err(e @ TryRecvError::Closed) => panic!(e),
+    //         }
+    //     };
+    //
+    //     if let Some(protocol) = protocol {
+    //         match protocol {
+    //             "http_1" => {
+    //                 let mut parser = Parser::new(content, &mut response_receiver);
+    //                 match parser.parse_and_recv(response_begin).await {
+    //                     Ok(begin) => info!(?begin, "http response"),
+    //                     Err(_) => error!("http_1 parse failed"),
+    //                 }
+    //             }
+    //             _ => {}
+    //         }
+    //     }
+    // };
 
     let delay = SystemTime::now()
         .duration_since(context.start_time)
@@ -251,4 +144,65 @@ async fn handle(
     info!(delay = ?delay);
 
     Ok(())
+}
+
+async fn client_to_proxy(mut socket_read: OwnedReadHalf, request_raw_delivery: RequestRawDelivery) {
+    let mut buf = [0; 4096];
+    let mut copied = 0;
+
+    loop {
+        let n = socket_read.read(&mut buf).await.unwrap();
+        if n == 0 {
+            debug!("request_sender None");
+            request_raw_delivery.request_raw_sender.send(None).unwrap();
+            break;
+        }
+        copied += n;
+
+        let content = (&buf[..n]).to_owned();
+        debug!("request_sender {:?}", Some(content.len()));
+        request_raw_delivery.request_raw_sender.send(Some(content)).unwrap();
+    }
+}
+
+async fn request_raw_transport(mut request_parser_delivery: RequestParserDelivery) {
+    loop {
+        let content = request_parser_delivery.request_raw_receiver.recv().await.unwrap();
+        match content {
+            Some(content) => {
+                request_parser_delivery.request_parsed_sender.send(RequestParsedData {
+                    protocol: Protocol::RAW,
+                    content:  RequestParsedContent::Content(content),
+                }).await.unwrap();
+            }
+            None => {
+                request_parser_delivery.request_parsed_sender.send(RequestParsedData {
+                    protocol: Protocol::RAW,
+                    content:  RequestParsedContent::Eof,
+                }).await.unwrap();
+                break;
+            }
+        }
+    }
+}
+
+async fn proxy_to_server(mut orig_write: OwnedWriteHalf, mut request_transport_delivery: RequestTransportDelivery) {
+    request_transport_delivery.response_protocol_sender.send(Protocol::RAW).unwrap();
+        loop {
+            let data = request_transport_delivery.request_parsed_receiver.recv().await.unwrap();
+            match data.protocol {
+                Protocol::RAW => match data.content {
+                    RequestParsedContent::Content(content) => {
+                        let n = orig_write.write(&content).await.unwrap();
+                        if n == 0 {
+                            panic!("Write zero");
+                        }
+                    }
+                    RequestParsedContent::Eof => break,
+                    RequestParsedContent::ParseFailed => debug!("protocol is not raw"),
+                }
+                _ => {}
+            }
+        }
+        orig_write.shutdown().await.unwrap();
 }

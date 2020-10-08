@@ -1,20 +1,102 @@
+pub mod http1;
+pub mod redis;
+
 use crate::error::{ITuziResult, TuziError, TuziResult};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use nom::{error::ErrorKind, IResult, Needed};
-
 use tokio::sync::{
     broadcast::{self},
-    mpsc,
+    mpsc, oneshot,
 };
 
+#[derive(Debug)]
+pub enum Protocol {
+    HTTP1,
+    REDIS,
+    MYSQL,
+    RAW,
+}
+
+#[derive(Debug)]
+pub struct RequestParsedData {
+    pub protocol: Protocol,
+    pub content: RequestParsedContent,
+}
+
+#[derive(Debug)]
+pub enum RequestParsedContent {
+    Content(Vec<u8>),
+    Eof,
+    ParseFailed,
+}
+
+pub struct RequestRawDelivery {
+    pub request_raw_sender: broadcast::Sender<Option<Vec<u8>>>,
+}
+
+pub struct RequestParserDelivery {
+    pub request_raw_receiver: broadcast::Receiver<Option<Vec<u8>>>,
+    pub request_parsed_sender: mpsc::Sender<RequestParsedData>,
+}
+
+pub struct RequestTransportDelivery {
+    pub request_parsed_receiver: mpsc::Receiver<RequestParsedData>,
+    pub response_protocol_sender: oneshot::Sender<Protocol>,
+}
+
+pub struct ResponseProtocolDelivery {
+    response_protocol_receiver: oneshot::Receiver<Protocol>,
+}
+
+pub fn delivery(
+    count: usize,
+) -> (
+    RequestRawDelivery,
+    Vec<RequestParserDelivery>,
+    RequestTransportDelivery,
+    ResponseProtocolDelivery,
+) {
+    let (request_raw_sender, _) = broadcast::channel(16);
+    let (request_parsed_sender, request_parsed_receiver) = mpsc::channel(16);
+    let (response_protocol_sender, response_protocol_receiver) = oneshot::channel();
+
+    let mut request_parsed_deliveries = Vec::new();
+    for _ in 0..count {
+        let request_raw_receiver = request_raw_sender.subscribe();
+        let request_parsed_sender = request_parsed_sender.clone();
+        request_parsed_deliveries.push(RequestParserDelivery {
+            request_raw_receiver,
+            request_parsed_sender,
+        });
+    }
+
+    let request_raw_delivery = RequestRawDelivery { request_raw_sender };
+
+    let request_transport_delivery = RequestTransportDelivery {
+        request_parsed_receiver,
+        response_protocol_sender,
+    };
+
+    let response_protocol_delivery = ResponseProtocolDelivery {
+        response_protocol_receiver,
+    };
+
+    (
+        request_raw_delivery,
+        request_parsed_deliveries,
+        request_transport_delivery,
+        response_protocol_delivery,
+    )
+}
+
 #[async_trait]
-pub trait Receiveable<T> {
+pub trait Receivable<T> {
     async fn receive(&mut self) -> TuziResult<T>;
 }
 
 #[async_trait]
-impl<T: Send> Receiveable<T> for mpsc::Receiver<T> {
+impl<T: Send> Receivable<T> for mpsc::Receiver<T> {
     async fn receive(&mut self) -> TuziResult<T> {
         match self.recv().await {
             Some(item) => Ok(item),
@@ -24,7 +106,7 @@ impl<T: Send> Receiveable<T> for mpsc::Receiver<T> {
 }
 
 #[async_trait]
-impl<T: Send + Clone> Receiveable<T> for broadcast::Receiver<T> {
+impl<T: Send + Clone> Receivable<T> for broadcast::Receiver<T> {
     async fn receive(&mut self) -> TuziResult<T> {
         match self.recv().await {
             Ok(item) => Ok(item),
@@ -34,17 +116,13 @@ impl<T: Send + Clone> Receiveable<T> for broadcast::Receiver<T> {
     }
 }
 
-pub struct Delivery {
-
-}
-
-pub struct Parser<'a, R: Receiveable<Option<Vec<u8>>>> {
+pub struct Parser<'a, R: Receivable<Option<Vec<u8>>>> {
     parse_content: Vec<u8>,
     recv_content: Vec<u8>,
     receiver: &'a mut R,
 }
 
-impl<'a, R: Receiveable<Option<Vec<u8>>>> Parser<'a, R> {
+impl<'a, R: Receivable<Option<Vec<u8>>>> Parser<'a, R> {
     pub fn new(init_parse_content: Vec<u8>, receiver: &'a mut R) -> Self {
         Self {
             parse_content: init_parse_content,
@@ -86,30 +164,5 @@ impl<'a, R: Receiveable<Option<Vec<u8>>>> Parser<'a, R> {
             self.parse_content.extend_from_slice(&b);
             self.recv_content.extend_from_slice(&b);
         }
-    }
-}
-
-pub async fn parse_and_recv<T>(
-    mut content: Vec<u8>,
-    receiver: &mut impl Receiveable<Option<Vec<u8>>>,
-    f: impl Fn(&[u8]) -> IResult<&[u8], T>,
-) -> Result<(Vec<u8>, Vec<u8>, T), nom::Err<(Vec<u8>, ErrorKind)>> {
-    let mut recv_content = Vec::new();
-    loop {
-        match f(&content) {
-            Ok((b, k)) => return Ok((b.to_owned(), recv_content, k)),
-            Err(e) => match e {
-                nom::Err::Incomplete(_) => {}
-                nom::Err::Error((b, k)) => return Err(nom::Err::Error((b.to_owned(), k))),
-                nom::Err::Failure((b, k)) => return Err(nom::Err::Failure((b.to_owned(), k))),
-            },
-        }
-        let b = receiver.receive().await.unwrap();
-        let b = match b {
-            Some(b) => b,
-            None => return Err(nom::Err::Incomplete(Needed::Unknown)),
-        };
-        content.extend_from_slice(&b);
-        recv_content.extend_from_slice(&b);
     }
 }

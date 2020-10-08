@@ -15,14 +15,12 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
-
 use tokio::sync::{
     broadcast::{self},
     mpsc,
 };
 use tracing::info;
-
-use super::Detection;
+use crate::parse::{RequestParserDelivery, RequestParsedData, Protocol, RequestParsedContent};
 
 #[derive(Debug, PartialEq)]
 pub struct RequestBegin {
@@ -31,11 +29,8 @@ pub struct RequestBegin {
     version: Version,
 }
 
-pub async fn detect(
-    mut receiver: broadcast::Receiver<Option<Vec<u8>>>,
-    mut request_protocol_sender: mpsc::Sender<Detection>,
-) -> TuziResult<()> {
-    let mut parser = Parser::new(Vec::new(), &mut receiver);
+pub async fn parse(mut request_parser_delivery: RequestParserDelivery ) -> TuziResult<()> {
+    let mut parser = Parser::new(Vec::new(), &mut request_parser_delivery.request_raw_receiver);
 
     let info = parser.parse_and_recv(begin).await?;
 
@@ -56,33 +51,42 @@ pub async fn detect(
     info!(?info, ?headers, "detect http");
 
     if !parser.recv_content_ref().is_empty() {
-        request_protocol_sender
-            .send(Detection {
-                protocol: "http_1",
-                data: Some(parser.recv_content_ref().to_owned()),
-            })
+        request_parser_delivery.request_parsed_sender
+            .send(
+                RequestParsedData {
+                    protocol: Protocol::HTTP1,
+                    content: RequestParsedContent::Content(parser.recv_content_ref().to_owned()),
+                }
+
+                )
             .await
             .unwrap();
     }
 
     loop {
-        let recv_content = receiver.recv().await.unwrap();
+        let recv_content = request_parser_delivery.request_raw_receiver.recv().await.unwrap();
         match recv_content {
             Some(recv_content) => {
-                request_protocol_sender
-                    .send(Detection {
-                        protocol: "http_1",
-                        data: Some(recv_content),
-                    })
+                request_parser_delivery.request_parsed_sender
+                    .send(
+                        RequestParsedData {
+                            protocol: Protocol::HTTP1,
+                            content: RequestParsedContent::Content(recv_content),
+                        }
+
+                        )
                     .await
                     .unwrap();
             }
             None => {
-                request_protocol_sender
-                    .send(Detection {
-                        protocol: "http_1",
-                        data: None,
-                    })
+                request_parser_delivery.request_parsed_sender
+                    .send(
+                        RequestParsedData {
+                            protocol: Protocol::HTTP1,
+                            content: RequestParsedContent::Eof
+                        }
+
+                        )
                     .await
                     .unwrap();
                 break;
@@ -152,3 +156,36 @@ pub fn respnose_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
     let (input, _) = terminated(is_not("\r\n"), crlf)(input)?;
     Ok((input, format!("version: {:?}, code: {}", version, code)))
 }
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+
+//     #[test]
+//     fn test_detect_protocol() {
+//         let input = b"GET /list.php?id=43705977 HTTP/1.1\r\nHost: www.google.com\r\nConnection: keep-alive\r\nPragma: no-cache\r\nCache-Control: no-cache\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.102 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7\r\n\r\n";
+
+//         assert_eq!(
+//             detect_http(input, &mut vec![]),
+//             Some(HttpRequestInfo {
+//                 method: Method::GET,
+//                 uri: "/list.php?id=43705977".to_owned(),
+//                 version: Version::HTTP_11,
+//             })
+//         );
+//     }
+
+//     #[test]
+//     fn test_nom() {
+//         let input = b"hel";
+
+//         fn parser(s: &[u8]) -> IResult<&[u8], &[u8]> {
+//             tag("hello")(s)
+//         }
+
+//         let output = parser(&input[..]);
+//         if let Err(err) = output {
+//             dbg!(err.is_incomplete());
+//         }
+//     }
+// }
