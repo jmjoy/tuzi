@@ -1,5 +1,5 @@
-use std::io;
 use nom::error::{ErrorKind, ParseError};
+use std::io;
 
 pub type TuziResult<T> = Result<T, TuziError>;
 

@@ -1,7 +1,8 @@
 use crate::{
     error::{ITuziResult, TuziResult},
-    parse::Parser,
+    parse::{Parser, ParserDelivery, Protocol, RequestParsedContent, RequestParsedData},
 };
+use async_trait::async_trait;
 use http::{Method, Version};
 use indexmap::IndexMap;
 use nom::{
@@ -15,12 +16,12 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{
     broadcast::{self},
     mpsc,
 };
 use tracing::info;
-use crate::parse::{RequestParserDelivery, RequestParsedData, Protocol, RequestParsedContent};
 
 #[derive(Debug, PartialEq)]
 pub struct RequestBegin {
@@ -29,8 +30,8 @@ pub struct RequestBegin {
     version: Version,
 }
 
-pub async fn parse(mut request_parser_delivery: RequestParserDelivery ) -> TuziResult<()> {
-    let mut parser = Parser::new(Vec::new(), &mut request_parser_delivery.request_raw_receiver);
+pub async fn parse(mut delivery: ParserDelivery) -> TuziResult<()> {
+    let mut parser = Parser::new(Vec::new(), &mut delivery.request_raw_receiver);
 
     let info = parser.parse_and_recv(begin).await?;
 
@@ -51,42 +52,36 @@ pub async fn parse(mut request_parser_delivery: RequestParserDelivery ) -> TuziR
     info!(?info, ?headers, "detect http");
 
     if !parser.recv_content_ref().is_empty() {
-        request_parser_delivery.request_parsed_sender
-            .send(
-                RequestParsedData {
-                    protocol: Protocol::HTTP1,
-                    content: RequestParsedContent::Content(parser.recv_content_ref().to_owned()),
-                }
-
-                )
+        delivery
+            .request_parsed_sender
+            .send(RequestParsedData {
+                protocol: Protocol::HTTP1,
+                content: RequestParsedContent::Content(parser.recv_content_ref().to_owned()),
+            })
             .await
             .unwrap();
     }
 
     loop {
-        let recv_content = request_parser_delivery.request_raw_receiver.recv().await.unwrap();
+        let recv_content = delivery.request_raw_receiver.recv().await.unwrap();
         match recv_content {
             Some(recv_content) => {
-                request_parser_delivery.request_parsed_sender
-                    .send(
-                        RequestParsedData {
-                            protocol: Protocol::HTTP1,
-                            content: RequestParsedContent::Content(recv_content),
-                        }
-
-                        )
+                delivery
+                    .request_parsed_sender
+                    .send(RequestParsedData {
+                        protocol: Protocol::HTTP1,
+                        content: RequestParsedContent::Content(recv_content),
+                    })
                     .await
                     .unwrap();
             }
             None => {
-                request_parser_delivery.request_parsed_sender
-                    .send(
-                        RequestParsedData {
-                            protocol: Protocol::HTTP1,
-                            content: RequestParsedContent::Eof
-                        }
-
-                        )
+                delivery
+                    .request_parsed_sender
+                    .send(RequestParsedData {
+                        protocol: Protocol::HTTP1,
+                        content: RequestParsedContent::Eof,
+                    })
                     .await
                     .unwrap();
                 break;

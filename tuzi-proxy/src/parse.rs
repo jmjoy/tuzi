@@ -4,18 +4,20 @@ pub mod redis;
 use crate::error::{ITuziResult, TuziError, TuziResult};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use derive_more::Display;
+use futures::Future;
 use nom::{error::ErrorKind, IResult, Needed};
+use std::pin::Pin;
 use tokio::sync::{
     broadcast::{self},
     mpsc, oneshot,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum Protocol {
     HTTP1,
     REDIS,
     MYSQL,
-    RAW,
 }
 
 #[derive(Debug)]
@@ -31,62 +33,59 @@ pub enum RequestParsedContent {
     ParseFailed,
 }
 
-pub struct RequestRawDelivery {
+pub struct ClientToProxyDelivery {
     pub request_raw_sender: broadcast::Sender<Option<Vec<u8>>>,
 }
 
-pub struct RequestParserDelivery {
+pub struct ParserDelivery {
     pub request_raw_receiver: broadcast::Receiver<Option<Vec<u8>>>,
     pub request_parsed_sender: mpsc::Sender<RequestParsedData>,
 }
 
-pub struct RequestTransportDelivery {
+pub struct ProxyToServerDelivery {
+    pub request_raw_receiver: broadcast::Receiver<Option<Vec<u8>>>,
     pub request_parsed_receiver: mpsc::Receiver<RequestParsedData>,
-    pub response_protocol_sender: oneshot::Sender<Protocol>,
+    pub response_protocol_sender: mpsc::Sender<Option<Protocol>>,
 }
 
-pub struct ResponseProtocolDelivery {
-    response_protocol_receiver: oneshot::Receiver<Protocol>,
+pub struct ServerToProxyDelivery {
+    pub response_protocol_receiver: mpsc::Receiver<Option<Protocol>>,
 }
 
 pub fn delivery(
     count: usize,
 ) -> (
-    RequestRawDelivery,
-    Vec<RequestParserDelivery>,
-    RequestTransportDelivery,
-    ResponseProtocolDelivery,
+    ClientToProxyDelivery,
+    Vec<ParserDelivery>,
+    ProxyToServerDelivery,
+    ServerToProxyDelivery,
 ) {
-    let (request_raw_sender, _) = broadcast::channel(16);
-    let (request_parsed_sender, request_parsed_receiver) = mpsc::channel(16);
-    let (response_protocol_sender, response_protocol_receiver) = oneshot::channel();
+    assert!(count > 0);
 
-    let mut request_parsed_deliveries = Vec::new();
+    let (request_raw_sender, request_raw_receiver) = broadcast::channel(16);
+    let (request_parsed_sender, request_parsed_receiver) = mpsc::channel(16);
+    let (response_protocol_sender, response_protocol_receiver) = mpsc::channel(16);
+
+    let mut parser_deliveries = Vec::new();
+
     for _ in 0..count {
-        let request_raw_receiver = request_raw_sender.subscribe();
-        let request_parsed_sender = request_parsed_sender.clone();
-        request_parsed_deliveries.push(RequestParserDelivery {
-            request_raw_receiver,
-            request_parsed_sender,
+        parser_deliveries.push(ParserDelivery {
+            request_raw_receiver: request_raw_sender.subscribe(),
+            request_parsed_sender: request_parsed_sender.clone(),
         });
     }
 
-    let request_raw_delivery = RequestRawDelivery { request_raw_sender };
-
-    let request_transport_delivery = RequestTransportDelivery {
-        request_parsed_receiver,
-        response_protocol_sender,
-    };
-
-    let response_protocol_delivery = ResponseProtocolDelivery {
-        response_protocol_receiver,
-    };
-
     (
-        request_raw_delivery,
-        request_parsed_deliveries,
-        request_transport_delivery,
-        response_protocol_delivery,
+        ClientToProxyDelivery { request_raw_sender },
+        parser_deliveries,
+        ProxyToServerDelivery {
+            request_raw_receiver,
+            request_parsed_receiver,
+            response_protocol_sender,
+        },
+        ServerToProxyDelivery {
+            response_protocol_receiver,
+        },
     )
 }
 
@@ -114,6 +113,11 @@ impl<T: Send + Clone> Receivable<T> for broadcast::Receiver<T> {
             Err(e @ broadcast::RecvError::Lagged(_)) => Err(anyhow!(e).into()),
         }
     }
+}
+
+pub struct ParseMeta {
+    pub protocol: Protocol,
+    pub parse_fn: fn() -> Pin<Box<dyn Future<Output = TuziResult<()>>>>,
 }
 
 pub struct Parser<'a, R: Receivable<Option<Vec<u8>>>> {

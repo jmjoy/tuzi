@@ -5,3 +5,9 @@
 //         crlf,
 //     )(input)
 // }
+
+use crate::{error::TuziResult, parse::ParserDelivery};
+
+pub async fn parse(mut request_parser_delivery: ParserDelivery) -> TuziResult<()> {
+    todo!()
+}
