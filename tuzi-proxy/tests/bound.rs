@@ -16,10 +16,10 @@ use tuzi_proxy::{
 async fn test_run_with_listener() {
     init_tracing();
 
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_listener = TcpListener::bind("localhost:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let server_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let server_listener = StdTcpListener::bind("localhost:0").unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
     let (server_signal_tx, server_signal_rx) = oneshot::channel();
@@ -31,7 +31,7 @@ async fn test_run_with_listener() {
     ));
 
     let client = Client::new();
-    let uri = format!("http://127.0.0.1:{}/", proxy_addr.port());
+    let uri = format!("http://localhost:{}/", proxy_addr.port());
     let uri = Uri::try_from(uri).unwrap();
     let response = client.get(uri).await.unwrap();
 

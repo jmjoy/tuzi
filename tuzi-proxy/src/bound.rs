@@ -1,7 +1,9 @@
 use crate::{
+    error::TuziResult,
     parse::{
-        delivery, http1, http1::respnose_begin, redis, ClientToProxyDelivery, ParseMeta, Parser,
-        ParserDelivery, Protocol, ProxyToServerDelivery, RequestParsedContent, RequestParsedData,
+        delivery, http1, http1::response_begin, receive_copy, redis, ClientToProxyDelivery,
+        Protocol, ProtocolParsable, ProxyToServerDelivery, ReceiveParser, RequestParsedContent,
+        RequestParsedData, RequestParserDelivery, ResponseParserDelivery, ResponseParserReader,
         ServerToProxyDelivery,
     },
     tcp::orig_dst_addr,
@@ -14,9 +16,10 @@ use futures::{
 use mpsc::error::TryRecvError;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     net::SocketAddr,
+    ops::Deref,
     rc::Rc,
     sync::{Arc, Once},
     time::SystemTime,
@@ -33,13 +36,24 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
+fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
+    let protocol_parsers = vec![http1::Parser];
+    let protocol_parsers = protocol_parsers
+        .into_iter()
+        .map(|parser| (parser.protocol(), Arc::new(parser) as _))
+        .collect();
+    Arc::new(protocol_parsers)
+}
+
 struct Context {
     start_time: SystemTime,
+    protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>,
 }
 
 impl Context {
-    fn new() -> Self {
+    fn new(protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>) -> Self {
         Self {
+            protocol_parsers,
             start_time: SystemTime::now(),
         }
     }
@@ -54,12 +68,15 @@ pub enum ServerAddr {
 pub async fn run_with_listener(mut listener: TcpListener, server_addr: ServerAddr) {
     debug!("after bind");
 
+    let protocol_parsers = new_protocol_parsers();
+
     loop {
         let (socket, _) = listener.accept().await.unwrap();
 
         debug!("after accept");
 
-        let context = Context::new();
+        let protocol_parsers = protocol_parsers.clone();
+        let context = Context::new(protocol_parsers);
 
         tokio::spawn(async move {
             let peer = socket.peer_addr().unwrap();
@@ -82,8 +99,6 @@ async fn handle(
     let mut orig = TcpStream::connect(orig_dst).await.unwrap();
     debug!("after connect to orig_dst");
 
-    let count = 1;
-
     let (mut socket_read, mut socket_write) = socket.into_split();
     let (mut orig_read, mut orig_write) = orig.into_split();
 
@@ -92,7 +107,7 @@ async fn handle(
         mut parser_deliveries,
         proxy_to_server_delivery,
         server_to_proxy_delivery,
-    ) = delivery(count);
+    ) = delivery(context.protocol_parsers.len());
 
     let mut handles = Vec::new();
 
@@ -101,27 +116,26 @@ async fn handle(
         client_to_proxy_delivery,
     )));
 
-    handles.push(tokio::spawn(async move {
-        http1::parse(parser_deliveries.pop().unwrap())
-            .await
-            .unwrap();
-    }));
+    for (_, protocol_parser) in context.protocol_parsers.iter() {
+        let delivery = parser_deliveries.pop().unwrap();
+        let protocol_parser = protocol_parser.clone();
+        handles.push(tokio::spawn(async move {
+            protocol_parser.parse_request(delivery).await.unwrap();
+        }));
+    }
 
     handles.push(tokio::spawn(proxy_to_server(
+        context.protocol_parsers.keys().map(|p| *p).collect(),
         orig_write,
         proxy_to_server_delivery,
     )));
 
     handles.push(tokio::spawn(server_to_proxy(
-        count,
+        context.protocol_parsers.clone(),
         orig_read,
         socket_write,
         server_to_proxy_delivery,
     )));
-
-    // handles.push(tokio::spawn(async move {
-    //     copy(&mut orig_read, &mut socket_write).await.unwrap();
-    // }));
 
     for handle in handles {
         handle.await.unwrap();
@@ -155,37 +169,55 @@ async fn client_to_proxy(mut socket_read: OwnedReadHalf, delivery: ClientToProxy
     }
 }
 
-async fn proxy_to_server(mut orig_write: OwnedWriteHalf, mut delivery: ProxyToServerDelivery) {
-    delivery.response_protocol_sender.send(None).await.unwrap();
-
+async fn proxy_to_server(
+    mut protocols: HashSet<Protocol>,
+    mut orig_write: OwnedWriteHalf,
+    mut delivery: ProxyToServerDelivery,
+) {
     let mut content = Vec::new();
+    let mut protocol = None;
 
     loop {
-        let raw_fut = delivery.request_raw_receiver.recv();
+        if protocols.is_empty() {
+            break;
+        }
+
         let parser_fut = delivery.request_parsed_receiver.recv();
+        let raw_fut = delivery.request_raw_receiver.recv();
         pin_mut!(parser_fut, raw_fut);
 
         match select(parser_fut, raw_fut).await {
             Either::Left((data, _)) => {
                 let data = data.unwrap();
-
-                // TODO detect more than one protocol.
-
-                break;
-
-                match data.protocol {
-                    _ => match data.content {
-                        RequestParsedContent::Content(content) => {
-                            debug!("request parsed content {} {}", data.protocol, content.len());
-
-                            // let n = orig_write.write(&content).await.unwrap();
-                            // if n == 0 {
-                            //     panic!("Write zero");
-                            // }
+                match data.content {
+                    RequestParsedContent::Content(content) => {
+                        detect_protocol(
+                            &mut protocol,
+                            data.protocol,
+                            &mut delivery.response_protocol_sender,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    RequestParsedContent::Raw => {
+                        detect_protocol(
+                            &mut protocol,
+                            data.protocol,
+                            &mut delivery.response_protocol_sender,
+                        )
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                    RequestParsedContent::Eof => {
+                        return;
+                    }
+                    RequestParsedContent::Failed => {
+                        debug!("protocol is not {}", data.protocol);
+                        if !protocols.remove(data.protocol) {
+                            todo!("?????");
                         }
-                        RequestParsedContent::Eof => break,
-                        RequestParsedContent::ParseFailed => debug!("protocol is not raw"),
-                    },
+                    }
                 }
             }
             Either::Right((buf, _)) => {
@@ -200,24 +232,34 @@ async fn proxy_to_server(mut orig_write: OwnedWriteHalf, mut delivery: ProxyToSe
         }
     }
 
-    loop {
-        let content = delivery.request_raw_receiver.recv().await.unwrap();
-        match content {
-            Some(content) => {
-                let n = orig_write.write(&content).await.unwrap();
-                if n == 0 {
-                    panic!("Write zero");
-                }
-            }
-            None => break,
-        }
-    }
+    receive_copy(&mut delivery.request_raw_receiver, &mut orig_write)
+        .await
+        .unwrap();
 
     orig_write.shutdown().await.unwrap();
 }
 
+async fn detect_protocol<'a>(
+    protocol: &'a mut Option<Protocol>,
+    detect_protocol: Protocol,
+    response_protocol_sender: &'a mut mpsc::Sender<Option<Protocol>>,
+) -> TuziResult<()> {
+    if protocol.is_some() {
+        if *protocol != Some(detect_protocol) {
+            panic!("multi protocol");
+        }
+    } else {
+        *protocol = Some(detect_protocol);
+        response_protocol_sender
+            .send(Some(detect_protocol))
+            .await
+            .unwrap();
+    }
+    Ok(())
+}
+
 async fn server_to_proxy(
-    count: usize,
+    protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>,
     mut server_read: OwnedReadHalf,
     mut client_write: OwnedWriteHalf,
     mut delivery: ServerToProxyDelivery,
@@ -229,7 +271,6 @@ async fn server_to_proxy(
     loop {
         let read_fut = server_read.read(&mut buf);
         let protocol_fut = delivery.response_protocol_receiver.recv();
-
         pin_mut!(read_fut, protocol_fut);
 
         match select(read_fut, protocol_fut).await {
@@ -251,8 +292,16 @@ async fn server_to_proxy(
     debug!(?protocol, "server_to_proxy, receive protocol");
 
     match protocol {
-        Some(_) => {
-            todo!();
+        Some(protocol) => {
+            let parser = protocol_parsers.get(protocol).unwrap();
+            let delivery = ResponseParserDelivery {
+                reader: ResponseParserReader {
+                    exists_content: Some(content),
+                    server_read,
+                },
+                client_write,
+            };
+            parser.parse_response(delivery).await.unwrap();
         }
         None => {
             if !content.is_empty() {

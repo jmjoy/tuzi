@@ -6,8 +6,8 @@
 //     )(input)
 // }
 
-use crate::{error::TuziResult, parse::ParserDelivery};
+use crate::{error::TuziResult, parse::RequestParserDelivery};
 
-pub async fn parse(mut request_parser_delivery: ParserDelivery) -> TuziResult<()> {
+pub async fn parse(mut request_parser_delivery: RequestParserDelivery) -> TuziResult<()> {
     todo!()
 }

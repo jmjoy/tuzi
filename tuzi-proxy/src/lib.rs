@@ -7,7 +7,7 @@ mod tcp;
 
 use crate::{
     error::TuziResult,
-    parse::{http1, ParseMeta, ParserDelivery, Protocol},
+    parse::{http1, Protocol, RequestParserDelivery},
 };
 use clap::Clap;
 use std::{future::Future, net::SocketAddr, rc::Rc};

@@ -1,6 +1,9 @@
 use crate::{
     error::{ITuziResult, TuziResult},
-    parse::{Parser, ParserDelivery, Protocol, RequestParsedContent, RequestParsedData},
+    parse::{
+        Protocol, ProtocolParsable, ReceiveParser, RequestParsedContent, RequestParsedData,
+        RequestParserDelivery, ResponseParserDelivery,
+    },
 };
 use async_trait::async_trait;
 use http::{Method, Version};
@@ -17,9 +20,12 @@ use nom::{
     IResult,
 };
 use std::{future::Future, pin::Pin, sync::Arc};
-use tokio::sync::{
-    broadcast::{self},
-    mpsc,
+use tokio::{
+    io::{copy, AsyncWriteExt},
+    sync::{
+        broadcast::{self},
+        mpsc,
+    },
 };
 use tracing::info;
 
@@ -30,66 +36,103 @@ pub struct RequestBegin {
     version: Version,
 }
 
-pub async fn parse(mut delivery: ParserDelivery) -> TuziResult<()> {
-    let mut parser = Parser::new(Vec::new(), &mut delivery.request_raw_receiver);
+pub struct Parser;
 
-    let info = parser.parse_and_recv(begin).await?;
-
-    let mut headers = IndexMap::new();
-    loop {
-        let item = parser.parse_and_recv(header).await?;
-        match item {
-            Some((key, value)) => {
-                headers
-                    .entry(String::from_utf8(key).unwrap())
-                    .or_insert(Vec::new())
-                    .push(String::from_utf8(value).unwrap());
-            }
-            None => break,
-        }
+#[async_trait]
+impl ProtocolParsable for Parser {
+    #[inline]
+    fn protocol(&self) -> Protocol {
+        "http/1"
     }
 
-    info!(?info, ?headers, "detect http");
+    async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()> {
+        let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.request_raw_receiver);
 
-    if !parser.recv_content_ref().is_empty() {
+        let info = parser.parse_and_recv(begin).await?;
+
+        let mut headers = IndexMap::new();
+        loop {
+            let item = parser.parse_and_recv(header).await?;
+            match item {
+                Some((key, value)) => {
+                    headers
+                        .entry(String::from_utf8(key).unwrap())
+                        .or_insert(Vec::new())
+                        .push(String::from_utf8(value).unwrap());
+                }
+                None => break,
+            }
+        }
+
+        info!(?info, ?headers, "detect http");
+
+        // TODO check the headers handler.
         delivery
             .request_parsed_sender
             .send(RequestParsedData {
-                protocol: Protocol::HTTP1,
-                content: RequestParsedContent::Content(parser.recv_content_ref().to_owned()),
+                protocol: self.protocol(),
+                content: RequestParsedContent::Raw,
             })
             .await
             .unwrap();
-    }
 
-    loop {
-        let recv_content = delivery.request_raw_receiver.recv().await.unwrap();
-        match recv_content {
-            Some(recv_content) => {
-                delivery
-                    .request_parsed_sender
-                    .send(RequestParsedData {
-                        protocol: Protocol::HTTP1,
-                        content: RequestParsedContent::Content(recv_content),
-                    })
-                    .await
-                    .unwrap();
-            }
-            None => {
-                delivery
-                    .request_parsed_sender
-                    .send(RequestParsedData {
-                        protocol: Protocol::HTTP1,
-                        content: RequestParsedContent::Eof,
-                    })
-                    .await
-                    .unwrap();
-                break;
+        return Ok(());
+
+        if !parser.recv_content_ref().is_empty() {
+            delivery
+                .request_parsed_sender
+                .send(RequestParsedData {
+                    protocol: self.protocol(),
+                    content: RequestParsedContent::Content(parser.recv_content_ref().to_owned()),
+                })
+                .await
+                .unwrap();
+        }
+
+        loop {
+            let recv_content = delivery.request_raw_receiver.recv().await.unwrap();
+            match recv_content {
+                Some(recv_content) => {
+                    delivery
+                        .request_parsed_sender
+                        .send(RequestParsedData {
+                            protocol: self.protocol(),
+                            content: RequestParsedContent::Content(recv_content),
+                        })
+                        .await
+                        .unwrap();
+                }
+                None => {
+                    delivery
+                        .request_parsed_sender
+                        .send(RequestParsedData {
+                            protocol: self.protocol(),
+                            content: RequestParsedContent::Eof,
+                        })
+                        .await
+                        .unwrap();
+                    break;
+                }
             }
         }
+
+        Ok(())
     }
 
-    Ok(())
+    async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
+        let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.reader);
+        let status = parser.parse_and_recv(response_begin).await.unwrap();
+        info!(?status, "Receive status");
+        delivery
+            .client_write
+            .write(parser.recv_content_ref())
+            .await
+            .unwrap();
+        copy(&mut delivery.reader.server_read, &mut delivery.client_write)
+            .await
+            .unwrap();
+        Ok(())
+    }
 }
 
 fn begin(input: &[u8]) -> ITuziResult<&[u8], RequestBegin> {
@@ -140,7 +183,7 @@ fn header(input: &[u8]) -> ITuziResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     Ok((input, kv))
 }
 
-pub fn respnose_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
+pub fn response_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
     let (input, version) = terminated(version, char(' '))(input)?;
     let (input, code) = terminated(
         map(take_while(is_digit), |s: &[u8]| {
@@ -151,36 +194,3 @@ pub fn respnose_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
     let (input, _) = terminated(is_not("\r\n"), crlf)(input)?;
     Ok((input, format!("version: {:?}, code: {}", version, code)))
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn test_detect_protocol() {
-//         let input = b"GET /list.php?id=43705977 HTTP/1.1\r\nHost: www.google.com\r\nConnection: keep-alive\r\nPragma: no-cache\r\nCache-Control: no-cache\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.102 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7\r\n\r\n";
-
-//         assert_eq!(
-//             detect_http(input, &mut vec![]),
-//             Some(HttpRequestInfo {
-//                 method: Method::GET,
-//                 uri: "/list.php?id=43705977".to_owned(),
-//                 version: Version::HTTP_11,
-//             })
-//         );
-//     }
-
-//     #[test]
-//     fn test_nom() {
-//         let input = b"hel";
-
-//         fn parser(s: &[u8]) -> IResult<&[u8], &[u8]> {
-//             tag("hello")(s)
-//         }
-
-//         let output = parser(&input[..]);
-//         if let Err(err) = output {
-//             dbg!(err.is_incomplete());
-//         }
-//     }
-// }

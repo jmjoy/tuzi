@@ -7,18 +7,17 @@ use async_trait::async_trait;
 use derive_more::Display;
 use futures::Future;
 use nom::{error::ErrorKind, IResult, Needed};
-use std::pin::Pin;
-use tokio::sync::{
-    broadcast::{self},
-    mpsc, oneshot,
+use std::{io, mem::replace, pin::Pin};
+use tokio::{
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::{
+        broadcast::{self},
+        mpsc, oneshot,
+    },
 };
 
-#[derive(Debug, Display)]
-pub enum Protocol {
-    HTTP1,
-    REDIS,
-    MYSQL,
-}
+pub type Protocol = &'static str;
 
 #[derive(Debug)]
 pub struct RequestParsedData {
@@ -30,14 +29,15 @@ pub struct RequestParsedData {
 pub enum RequestParsedContent {
     Content(Vec<u8>),
     Eof,
-    ParseFailed,
+    Raw,
+    Failed,
 }
 
 pub struct ClientToProxyDelivery {
     pub request_raw_sender: broadcast::Sender<Option<Vec<u8>>>,
 }
 
-pub struct ParserDelivery {
+pub struct RequestParserDelivery {
     pub request_raw_receiver: broadcast::Receiver<Option<Vec<u8>>>,
     pub request_parsed_sender: mpsc::Sender<RequestParsedData>,
 }
@@ -56,7 +56,7 @@ pub fn delivery(
     count: usize,
 ) -> (
     ClientToProxyDelivery,
-    Vec<ParserDelivery>,
+    Vec<RequestParserDelivery>,
     ProxyToServerDelivery,
     ServerToProxyDelivery,
 ) {
@@ -69,7 +69,7 @@ pub fn delivery(
     let mut parser_deliveries = Vec::new();
 
     for _ in 0..count {
-        parser_deliveries.push(ParserDelivery {
+        parser_deliveries.push(RequestParserDelivery {
             request_raw_receiver: request_raw_sender.subscribe(),
             request_parsed_sender: request_parsed_sender.clone(),
         });
@@ -115,18 +115,75 @@ impl<T: Send + Clone> Receivable<T> for broadcast::Receiver<T> {
     }
 }
 
-pub struct ParseMeta {
-    pub protocol: Protocol,
-    pub parse_fn: fn() -> Pin<Box<dyn Future<Output = TuziResult<()>>>>,
+pub struct ResponseParserReader {
+    pub exists_content: Option<Vec<u8>>,
+    pub server_read: OwnedReadHalf,
 }
 
-pub struct Parser<'a, R: Receivable<Option<Vec<u8>>>> {
+pub struct ResponseParserDelivery {
+    pub reader: ResponseParserReader,
+    pub client_write: OwnedWriteHalf,
+}
+
+#[async_trait]
+impl Receivable<Option<Vec<u8>>> for ResponseParserReader {
+    async fn receive(&mut self) -> TuziResult<Option<Vec<u8>>> {
+        if self.exists_content.is_some() {
+            let content = replace(&mut self.exists_content, None);
+            if let Some(content) = content {
+                if !content.is_empty() {
+                    return Ok(Some(content));
+                }
+            }
+        }
+        let mut buf = [0; 4096];
+        let n = self.server_read.read(&mut buf).await?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((&buf[..n]).to_owned()))
+        }
+    }
+}
+
+pub async fn receive_copy<R, W>(r: &mut R, w: &mut W) -> TuziResult<()>
+where
+    R: Receivable<Option<Vec<u8>>>,
+    W: AsyncWrite + Unpin + Send,
+{
+    loop {
+        let content = r.receive().await?;
+        match content {
+            Some(content) => {
+                let n = w.write(&content).await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    )
+                    .into());
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+pub trait ProtocolParsable: Send + Sync {
+    fn protocol(&self) -> Protocol;
+    async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()>;
+    async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()>;
+}
+
+pub struct ReceiveParser<'a, R: Receivable<Option<Vec<u8>>>> {
     parse_content: Vec<u8>,
     recv_content: Vec<u8>,
     receiver: &'a mut R,
 }
 
-impl<'a, R: Receivable<Option<Vec<u8>>>> Parser<'a, R> {
+impl<'a, R: Receivable<Option<Vec<u8>>>> ReceiveParser<'a, R> {
     pub fn new(init_parse_content: Vec<u8>, receiver: &'a mut R) -> Self {
         Self {
             parse_content: init_parse_content,
