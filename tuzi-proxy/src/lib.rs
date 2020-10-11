@@ -14,8 +14,8 @@ use std::{future::Future, net::SocketAddr, rc::Rc};
 
 #[derive(Debug, Clap)]
 pub struct Configuration {
-    #[clap(long)]
-    inbound: SocketAddr,
+    // #[clap(long)]
+    // inbound: SocketAddr,
     #[clap(long)]
     outbound: SocketAddr,
 }

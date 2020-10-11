@@ -37,10 +37,11 @@ use tokio::{
 use tracing::{debug, error, info, instrument, warn};
 
 fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
-    let protocol_parsers = vec![http1::Parser];
+    let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
+        &[Arc::new(http1::Parser), Arc::new(redis::Parser)];
     let protocol_parsers = protocol_parsers
-        .into_iter()
-        .map(|parser| (parser.protocol(), Arc::new(parser) as _))
+        .iter()
+        .map(|parser| (parser.protocol(), parser.clone()))
         .collect();
     Arc::new(protocol_parsers)
 }
@@ -120,7 +121,9 @@ async fn handle(
         let delivery = parser_deliveries.pop().unwrap();
         let protocol_parser = protocol_parser.clone();
         handles.push(tokio::spawn(async move {
-            protocol_parser.parse_request(delivery).await.unwrap();
+            match protocol_parser.parse_request(delivery).await {
+
+            }
         }));
     }
 
