@@ -1,40 +1,35 @@
 use crate::{
     error::TuziResult,
     parse::{
-        delivery, http1, http1::response_begin, receive_copy, redis, ClientToProxyDelivery,
-        Protocol, ProtocolParsable, ProxyToServerDelivery, ReceiveParser, RequestParsedContent,
-        RequestParsedData, RequestParserDelivery, ResponseParserDelivery, ResponseParserReader,
+        delivery, http1, receive_copy, redis, ClientToProxyDelivery,
+        Protocol, ProtocolParsable, ProxyToServerDelivery, RequestParsedContent,
+        RequestParsedData, ResponseParserDelivery, ResponseParserReader,
         ServerToProxyDelivery,
     },
     tcp::orig_dst_addr,
-    Configuration,
 };
+use async_trait::async_trait;
 use futures::{
     future::{select, Either},
     pin_mut,
 };
-use mpsc::error::TryRecvError;
+
+use crate::error::TuziError;
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    io::Cursor,
     net::SocketAddr,
-    ops::Deref,
-    rc::Rc,
-    sync::{Arc, Once},
+    sync::Arc,
     time::SystemTime,
 };
 use tokio::{
-    io::{copy, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Seek},
-    join,
+    io::{copy, AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{broadcast, mpsc, oneshot},
-    try_join,
+    sync::mpsc,
 };
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
     let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
@@ -60,18 +55,31 @@ impl Context {
     }
 }
 
-#[derive(Copy, Clone)]
-pub enum ServerAddr {
-    OriginalDst,
-    Manual(SocketAddr),
+#[async_trait]
+pub trait ServerAddrProvidable {
+    async fn provide_server_addr(&self, socket: &TcpStream) -> TuziResult<SocketAddr>;
 }
 
-pub async fn run_with_listener(mut listener: TcpListener, server_addr: ServerAddr) {
+#[derive(Clone)]
+pub struct OriginalDst;
+
+#[async_trait]
+impl ServerAddrProvidable for OriginalDst {
+    async fn provide_server_addr(&self, socket: &TcpStream) -> TuziResult<SocketAddr> {
+        Ok(orig_dst_addr(&socket).unwrap())
+    }
+}
+
+pub async fn run_with_listener(
+    mut listener: TcpListener,
+    providable: impl ServerAddrProvidable + Send + Sync + Clone + 'static,
+) {
     debug!("after bind");
 
     let protocol_parsers = new_protocol_parsers();
 
     loop {
+        let providable = providable.clone();
         let (socket, _) = listener.accept().await.unwrap();
 
         debug!("after accept");
@@ -81,10 +89,7 @@ pub async fn run_with_listener(mut listener: TcpListener, server_addr: ServerAdd
 
         tokio::spawn(async move {
             let peer = socket.peer_addr().unwrap();
-            let orig_dst = match server_addr {
-                ServerAddr::OriginalDst => orig_dst_addr(&socket).unwrap(),
-                ServerAddr::Manual(addr) => addr,
-            };
+            let orig_dst = providable.provide_server_addr(&socket).await.unwrap();
             handle(peer, orig_dst, socket, context).await.unwrap();
         });
     }
@@ -94,14 +99,14 @@ pub async fn run_with_listener(mut listener: TcpListener, server_addr: ServerAdd
 async fn handle(
     peer: SocketAddr,
     orig_dst: SocketAddr,
-    mut socket: TcpStream,
+    socket: TcpStream,
     context: Context,
 ) -> anyhow::Result<()> {
-    let mut orig = TcpStream::connect(orig_dst).await.unwrap();
+    let orig = TcpStream::connect(orig_dst).await.unwrap();
     debug!("after connect to orig_dst");
 
-    let (mut socket_read, mut socket_write) = socket.into_split();
-    let (mut orig_read, mut orig_write) = orig.into_split();
+    let (socket_read, socket_write) = socket.into_split();
+    let (orig_read, orig_write) = orig.into_split();
 
     let (
         client_to_proxy_delivery,
@@ -121,8 +126,20 @@ async fn handle(
         let delivery = parser_deliveries.pop().unwrap();
         let protocol_parser = protocol_parser.clone();
         handles.push(tokio::spawn(async move {
-            match protocol_parser.parse_request(delivery).await {
-
+            let mut request_parsed_sender = delivery.request_parsed_sender.clone();
+            if let Err(e) = protocol_parser.parse_request(delivery).await {
+                match e {
+                    TuziError::Nom(_) => {
+                        request_parsed_sender
+                            .send(RequestParsedData {
+                                protocol: protocol_parser.protocol(),
+                                content: RequestParsedContent::Failed,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    e => panic!(e),
+                }
             }
         }));
     }
@@ -189,11 +206,14 @@ async fn proxy_to_server(
         let raw_fut = delivery.request_raw_receiver.recv();
         pin_mut!(parser_fut, raw_fut);
 
+        // TODO Adjust must wait all protocol parser sent.
+
         match select(parser_fut, raw_fut).await {
             Either::Left((data, _)) => {
                 let data = data.unwrap();
+                debug!(data.protocol, "request_parsed_receiver, recv");
                 match data.content {
-                    RequestParsedContent::Content(content) => {
+                    RequestParsedContent::Content(_content) => {
                         detect_protocol(
                             &mut protocol,
                             data.protocol,
@@ -203,6 +223,7 @@ async fn proxy_to_server(
                         .unwrap();
                     }
                     RequestParsedContent::Raw => {
+                        debug!("protocol is raw {}", data.protocol);
                         detect_protocol(
                             &mut protocol,
                             data.protocol,
@@ -235,6 +256,12 @@ async fn proxy_to_server(
         }
     }
 
+    if !content.is_empty() {
+        let n = orig_write.write(&content).await.unwrap();
+        if n == 0 {
+            todo!("Write zero");
+        }
+    }
     receive_copy(&mut delivery.request_raw_receiver, &mut orig_write)
         .await
         .unwrap();

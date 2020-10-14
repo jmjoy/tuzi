@@ -1,5 +1,5 @@
 use crate::{
-    error::{ITuziResult, TuziResult},
+    error::TuziResult,
     parse::{
         Protocol, ProtocolParsable, ReceiveParser, RequestParsedContent, RequestParsedData,
         RequestParserDelivery, ResponseParserDelivery,
@@ -10,24 +10,18 @@ use http::{Method, Version};
 use indexmap::IndexMap;
 use nom::{
     branch::alt,
-    bytes::streaming::{is_not, tag, take_till, take_while},
+    bytes::streaming::{is_not, tag, take_while},
     character::{
         is_digit,
-        streaming::{char, crlf, digit1, one_of},
+        streaming::{char, crlf, one_of},
     },
     combinator::{map, value},
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
-use std::{future::Future, pin::Pin, sync::Arc};
-use tokio::{
-    io::{copy, AsyncWriteExt},
-    sync::{
-        broadcast::{self},
-        mpsc,
-    },
-};
-use tracing::info;
+
+use tokio::io::{copy, AsyncWriteExt};
+use tracing::{debug, info};
 
 #[derive(Debug, PartialEq)]
 pub struct RequestBegin {
@@ -120,6 +114,8 @@ impl ProtocolParsable for Parser {
     }
 
     async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
+        debug!("parse_response {}", self.protocol());
+
         let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.reader);
         let status = parser.parse_and_recv(response_begin).await.unwrap();
         info!(?status, "Receive status");
@@ -135,7 +131,7 @@ impl ProtocolParsable for Parser {
     }
 }
 
-fn begin(input: &[u8]) -> ITuziResult<&[u8], RequestBegin> {
+fn begin(input: &[u8]) -> IResult<&[u8], RequestBegin> {
     let (input, method) = method(input)?;
     let (input, uri) = delimited(char(' '), is_not(" \r\n"), char(' '))(input)?;
     let (input, version) = terminated(version, crlf)(input)?;
@@ -150,7 +146,7 @@ fn begin(input: &[u8]) -> ITuziResult<&[u8], RequestBegin> {
     ))
 }
 
-fn method(input: &[u8]) -> ITuziResult<&[u8], Method> {
+fn method(input: &[u8]) -> IResult<&[u8], Method> {
     alt((
         value(Method::GET, tag("GET")),
         value(Method::POST, tag("POST")),
@@ -160,7 +156,7 @@ fn method(input: &[u8]) -> ITuziResult<&[u8], Method> {
     ))(input)
 }
 
-fn version(input: &[u8]) -> ITuziResult<&[u8], Version> {
+fn version(input: &[u8]) -> IResult<&[u8], Version> {
     preceded(
         tag("HTTP/1."),
         map(one_of("01"), |v| match v {
@@ -171,7 +167,7 @@ fn version(input: &[u8]) -> ITuziResult<&[u8], Version> {
     )(input)
 }
 
-fn header(input: &[u8]) -> ITuziResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
+fn header(input: &[u8]) -> IResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     let (input, kv) = alt((
         map(crlf, |_| None),
         map(
@@ -183,7 +179,7 @@ fn header(input: &[u8]) -> ITuziResult<&[u8], Option<(Vec<u8>, Vec<u8>)>> {
     Ok((input, kv))
 }
 
-pub fn response_begin(input: &[u8]) -> ITuziResult<&[u8], String> {
+pub fn response_begin(input: &[u8]) -> IResult<&[u8], String> {
     let (input, version) = terminated(version, char(' '))(input)?;
     let (input, code) = terminated(
         map(take_while(is_digit), |s: &[u8]| {

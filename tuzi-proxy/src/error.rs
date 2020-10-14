@@ -1,34 +1,25 @@
-use nom::error::{ErrorKind, ParseError};
+use nom::error::ErrorKind;
 use std::io;
 
 pub type TuziResult<T> = Result<T, TuziError>;
-
-pub type ITuziResult<I, O> = Result<(I, O), nom::Err<TuziError>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum TuziError {
     #[error("receiver closed")]
     ReceiveClosed,
 
-    #[error("parse incomplete")]
-    ParseIncomplete,
-
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    #[error("nom error kind ({1:?})")]
-    Nom(Vec<u8>, ErrorKind),
+    #[error(transparent)]
+    Nom(nom::Err<(Vec<u8>, ErrorKind)>),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
-impl ParseError<&[u8]> for TuziError {
-    fn from_error_kind(input: &[u8], kind: ErrorKind) -> Self {
-        TuziError::Nom(input.to_owned(), kind)
-    }
-
-    fn append(_input: &[u8], _kind: ErrorKind, other: Self) -> Self {
-        other
+impl From<nom::Err<(&[u8], ErrorKind)>> for TuziError {
+    fn from(e: nom::Err<(&[u8], ErrorKind)>) -> Self {
+        TuziError::Nom(e.map(|(b, k)| (b.to_owned(), k)))
     }
 }

@@ -5,12 +5,10 @@ mod outbound;
 mod parse;
 mod tcp;
 
-use crate::{
-    error::TuziResult,
-    parse::{http1, Protocol, RequestParserDelivery},
-};
+pub use crate::parse::Protocol;
+
 use clap::Clap;
-use std::{future::Future, net::SocketAddr, rc::Rc};
+use std::{net::SocketAddr, rc::Rc};
 
 #[derive(Debug, Clap)]
 pub struct Configuration {

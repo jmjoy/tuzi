@@ -1,5 +1,5 @@
 use crate::{
-    error::{ITuziResult, TuziResult},
+    error::TuziResult,
     parse::{
         ProtocolParsable, ReceiveParser, RequestParsedContent, RequestParsedData,
         RequestParserDelivery, ResponseParserDelivery,
@@ -11,6 +11,7 @@ use nom::{
     character::streaming::{crlf, digit1},
     combinator::map,
     sequence::delimited,
+    IResult,
 };
 use std::str;
 use tracing::info;
@@ -38,12 +39,12 @@ impl ProtocolParsable for Parser {
         Ok(())
     }
 
-    async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
+    async fn parse_response(&self, _delivery: ResponseParserDelivery) -> TuziResult<()> {
         unimplemented!()
     }
 }
 
-fn args_count(input: &[u8]) -> ITuziResult<&[u8], usize> {
+fn args_count(input: &[u8]) -> IResult<&[u8], usize> {
     delimited(
         tag("*"),
         map(digit1, |s| str::from_utf8(s).unwrap().parse().unwrap()),

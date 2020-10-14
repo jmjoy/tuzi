@@ -1,19 +1,19 @@
 pub mod http1;
 pub mod redis;
 
-use crate::error::{ITuziResult, TuziError, TuziResult};
+use crate::error::{TuziError, TuziResult};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use derive_more::Display;
-use futures::Future;
-use nom::{error::ErrorKind, IResult, Needed};
-use std::{io, mem::replace, pin::Pin};
+use tracing::debug;
+
+use nom::{IResult, Needed};
+use std::{io, mem::replace};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::{
         broadcast::{self},
-        mpsc, oneshot,
+        mpsc,
     },
 };
 
@@ -128,14 +128,17 @@ pub struct ResponseParserDelivery {
 #[async_trait]
 impl Receivable<Option<Vec<u8>>> for ResponseParserReader {
     async fn receive(&mut self) -> TuziResult<Option<Vec<u8>>> {
+        debug!("reader receive");
         if self.exists_content.is_some() {
             let content = replace(&mut self.exists_content, None);
             if let Some(content) = content {
                 if !content.is_empty() {
+                    debug!("reader return exists content");
                     return Ok(Some(content));
                 }
             }
         }
+        debug!("reader read");
         let mut buf = [0; 4096];
         let n = self.server_read.read(&mut buf).await?;
         if n == 0 {
@@ -202,7 +205,7 @@ impl<'a, R: Receivable<Option<Vec<u8>>>> ReceiveParser<'a, R> {
 
     pub async fn parse_and_recv<T>(
         &mut self,
-        f: impl Fn(&[u8]) -> ITuziResult<&[u8], T>,
+        f: impl Fn(&[u8]) -> IResult<&[u8], T>,
     ) -> TuziResult<T> {
         loop {
             match f(&self.parse_content) {
@@ -212,14 +215,13 @@ impl<'a, R: Receivable<Option<Vec<u8>>>> ReceiveParser<'a, R> {
                 }
                 Err(e) => match e {
                     nom::Err::Incomplete(_) => {}
-                    nom::Err::Error(e) => return Err(e),
-                    nom::Err::Failure(e) => return Err(e),
+                    e => return Err(e.into()),
                 },
             }
             let b = self.receiver.receive().await?;
             let b = match b {
                 Some(b) => b,
-                None => return Err(TuziError::ParseIncomplete),
+                None => return Err(TuziError::Nom(nom::Err::Incomplete(Needed::Unknown))),
             };
 
             self.parse_content.extend_from_slice(&b);
