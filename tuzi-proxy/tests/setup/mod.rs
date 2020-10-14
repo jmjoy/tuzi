@@ -1,8 +1,8 @@
 pub mod http1;
+pub mod redis;
 
 use async_trait::async_trait;
-use std::{convert::TryFrom, net::TcpListener as StdTcpListener, sync::Arc, task};
-
+use std::{convert::TryFrom, net::TcpListener as StdTcpListener, sync::Arc, thread, task};
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -12,14 +12,11 @@ use tuzi_proxy::{
     bound::{run_with_listener, ServerAddrProvidable},
     error::TuziResult,
 };
-
 use futures::Future;
 use hyper::{Body, Client, Uri};
 use once_cell::sync::OnceCell;
 use tuzi_proxy::{init_tracing, Protocol};
-
 use std::task::Poll;
-
 use hyper::client::{
     connect::{
         dns::{GaiResolver, Resolve},
@@ -28,13 +25,35 @@ use hyper::client::{
     HttpConnector,
 };
 use std::marker::PhantomData;
+use tokio::task::JoinHandle;
+use tokio::sync::broadcast;
+use tokio::sync::oneshot;
+use std::sync::atomic::AtomicPtr;
+use std::ptr::null_mut;
+use std::sync::atomic::Ordering;
+use tokio::task::spawn_blocking;
+use testcontainers::{clients, Docker, images};
+
+// static EXIT_SIGNAL_RX: OnceCell<oneshot::Receiver<()>> = OnceCell::new();
+static SHUTDOWN_SIGNAL_TX: OnceCell<broadcast::Sender<()>> = OnceCell::new();
+static JOIN_HANDLES_PTR: AtomicPtr<Vec<JoinHandle<()>>> = AtomicPtr::new(null_mut());
 
 pub async fn setup_servers() -> &'static Context {
     static CONTEXT: OnceCell<Context> = OnceCell::new();
     let context = CONTEXT.get_or_init(Default::default);
 
     let b = call_once(async {
+        dbg!("call_once");
+
         init_tracing();
+
+        let mut join_handles = Vec::new();
+
+        // let (exit_signal_tx, exit_signal_rx) = oneshot::channel();
+        // EXIT_SIGNAL_RX.set(exit_signal_rx).unwrap();
+
+        let (shutdown_signal_tx, mut shutdown_signal_rx) = broadcast::channel(16);
+        SHUTDOWN_SIGNAL_TX.set(shutdown_signal_tx).unwrap();
 
         // proxy server
         let proxy_listener = TcpListener::bind("localhost:0").await.unwrap();
@@ -42,10 +61,10 @@ pub async fn setup_servers() -> &'static Context {
             .protocol_mapping
             .insert("proxy", proxy_listener.local_addr().unwrap())
             .await;
-        tokio::spawn(run_with_listener(
+        join_handles.push(tokio::spawn(run_with_listener(
             proxy_listener,
             context.addr_mapping.clone(),
-        ));
+        )));
 
         // http server
         let http_listener = StdTcpListener::bind("localhost:0").unwrap();
@@ -53,7 +72,27 @@ pub async fn setup_servers() -> &'static Context {
             .protocol_mapping
             .insert("http1", http_listener.local_addr().unwrap())
             .await;
-        tokio::spawn(http1::server(http_listener, None));
+        join_handles.push(tokio::spawn(http1::server(http_listener, async move {
+            shutdown_signal_rx.recv().await.unwrap();
+        })));
+
+        // join_handles.push(spawn_blocking(|| {
+        //     let docker = clients::Cli::default();
+        //     let node = docker.run(images::redis::Redis::default());
+        //     let host_port = node.get_host_port(6379).unwrap();
+        //     let url = format!("redis://localhost:{}", host_port);
+        //     dbg!(url);
+        // }));
+
+        JOIN_HANDLES_PTR.store(Box::into_raw(Box::new(join_handles)), Ordering::SeqCst);
+
+        // // wait all join handles
+        // tokio::spawn(async move {
+        //     for join_handle in join_handles {
+        //         join_handle.await.unwrap();
+        //     }
+        //     exit_signal_tx.send(()).unwrap();
+        // });
     })
     .await;
 
@@ -62,6 +101,17 @@ pub async fn setup_servers() -> &'static Context {
     }
 
     context
+}
+
+#[tokio::test]
+async fn teardown() {
+    // SHUTDOWN_SIGNAL_TX.get().unwrap().send(()).unwrap();
+    // EXIT_SIGNAL_RX.get().unwrap().await;
+
+    // let join_handles = unsafe { Box::from_raw(JOIN_HANDLES_PTR.load(Ordering::SeqCst)) };
+    // for join_handle in join_handles.into_iter() {
+    //     join_handle.await.unwrap();
+    // }
 }
 
 pub async fn call_once(fut: impl Future<Output = ()>) -> bool {
