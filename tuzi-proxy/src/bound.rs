@@ -1,25 +1,27 @@
 use crate::{
-    error::TuziResult,
+    error::{TuziError, TuziResult},
     parse::{
-        delivery, http1, receive_copy, redis, ClientToProxyDelivery,
-        Protocol, ProtocolParsable, ProxyToServerDelivery, RequestParsedContent,
-        RequestParsedData, ResponseParserDelivery, ResponseParserReader,
-        ServerToProxyDelivery,
+        delivery, http1, receive_copy, redis, ClientToProxyDelivery, Protocol, ProtocolParsable,
+        ProxyToServerDelivery, RequestParsedContent, RequestParsedData, ResponseParserDelivery,
+        ResponseParserReader, ServerToProxyDelivery,
     },
     tcp::orig_dst_addr,
+    waitgroup::WaitGroup,
 };
 use async_trait::async_trait;
 use futures::{
     future::{select, Either},
     pin_mut,
 };
-
-use crate::error::TuziError;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     net::SocketAddr,
-    sync::Arc,
-    time::SystemTime,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{copy, AsyncReadExt, AsyncWriteExt},
@@ -28,6 +30,8 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::mpsc,
+    task::spawn_blocking,
+    time::delay_for,
 };
 use tracing::{debug, info, instrument};
 
@@ -73,26 +77,52 @@ impl ServerAddrProvidable for OriginalDst {
 pub async fn run_with_listener(
     mut listener: TcpListener,
     providable: impl ServerAddrProvidable + Send + Sync + Clone + 'static,
+    signal: impl Future<Output = TuziResult<()>>,
 ) {
-    debug!("after bind");
+    let wg = WaitGroup::new();
+    let worker = wg.worker();
 
     let protocol_parsers = new_protocol_parsers();
 
-    loop {
-        let providable = providable.clone();
-        let (socket, _) = listener.accept().await.unwrap();
+    let (mut shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
-        debug!("after accept");
+    let join = tokio::spawn(async move {
+        loop {
+            let providable = providable.clone();
 
-        let protocol_parsers = protocol_parsers.clone();
-        let context = Context::new(protocol_parsers);
+            let shutdown_fut = shutdown_rx.recv();
+            let listener_fut = listener.accept();
+            pin_mut!(shutdown_fut, listener_fut);
 
-        tokio::spawn(async move {
-            let peer = socket.peer_addr().unwrap();
-            let orig_dst = providable.provide_server_addr(&socket).await.unwrap();
-            handle(peer, orig_dst, socket, context).await.unwrap();
-        });
-    }
+            match select(shutdown_fut, listener_fut).await {
+                Either::Left((r, _)) => {
+                    debug!("shutdown_rx recv");
+                    break;
+                }
+                Either::Right((r, _)) => {
+                    let (socket, _) = r.unwrap();
+                    let worker = worker.clone();
+
+                    let protocol_parsers = protocol_parsers.clone();
+                    let context = Context::new(protocol_parsers);
+
+                    tokio::spawn(async move {
+                        let peer = socket.peer_addr().unwrap();
+                        let orig_dst = providable.provide_server_addr(&socket).await.unwrap();
+                        handle(peer, orig_dst, socket, context).await.unwrap();
+                        drop(worker);
+                    });
+                }
+            }
+        }
+    });
+
+    signal.await.unwrap();
+    debug!("signal received, starting graceful shutdown");
+
+    shutdown_tx.send(()).await.unwrap();
+    join.await.unwrap();
+    wg.wait().await;
 }
 
 #[instrument(name = "bound:handle", skip(socket, context))]

@@ -4,6 +4,7 @@ mod inbound;
 mod outbound;
 mod parse;
 mod tcp;
+pub mod waitgroup;
 
 pub use crate::parse::Protocol;
 

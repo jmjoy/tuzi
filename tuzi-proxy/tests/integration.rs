@@ -1,14 +1,21 @@
 mod setup;
 
-use hyper::body;
-
-use crate::setup::setup_servers;
+use crate::setup::{setup, Context};
 use http::{Method, Request};
+use hyper::body;
+use nom::lib::std::alloc::handle_alloc_error;
+use std::thread;
+use tokio::time::delay_for;
 
 #[tokio::test]
-async fn test_http1_index() {
-    let context = setup_servers().await;
+async fn test_all() {
+    let (context, mut handles) = setup().await;
+    handles.add_test(test_http1_index(context.clone())).await;
+    handles.add_test(test_http1_echo(context.clone())).await;
+    handles.wait().await;
+}
 
+async fn test_http1_index(context: Context) {
     let client = context.build_client();
     let uri = context.build_http_uri("/").await;
     let response = client.get(uri).await.unwrap();
@@ -20,10 +27,7 @@ async fn test_http1_index() {
     assert_eq!(content, "Hello, World!");
 }
 
-#[tokio::test]
-async fn test_http1_echo() {
-    let context = setup_servers().await;
-
+async fn test_http1_echo(context: Context) {
     let client = context.build_client();
     let uri = context.build_http_uri("/echo").await;
     let request = Request::builder()

@@ -3,10 +3,9 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server,
 };
-use std::{convert::Infallible, net::TcpListener as StdTcpListener};
+use std::{convert::Infallible, future::Future, net::TcpListener as StdTcpListener};
 use tokio::sync::oneshot;
 use tracing::{debug, instrument};
-use std::future::Future;
 
 #[instrument(name = "test-server-http1:handle", skip(req))]
 async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
@@ -29,7 +28,5 @@ pub async fn server(listener: StdTcpListener, signal: impl Future<Output = ()>) 
 
     let server = Server::from_tcp(listener).unwrap().serve(make_svc);
 
-    server.with_graceful_shutdown(signal)
-        .await
-        .unwrap();
+    server.with_graceful_shutdown(signal).await.unwrap();
 }

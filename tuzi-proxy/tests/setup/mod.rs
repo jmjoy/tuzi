@@ -2,117 +2,132 @@ pub mod http1;
 pub mod redis;
 
 use async_trait::async_trait;
-use std::{convert::TryFrom, net::TcpListener as StdTcpListener, sync::Arc, thread, task};
-use std::{collections::HashMap, net::SocketAddr};
+use futures::{ready, Future, TryFutureExt};
+use hyper::{
+    client::{
+        connect::{
+            dns::{GaiResolver, Resolve},
+            http::{ConnectError, HttpConnecting},
+        },
+        HttpConnector,
+    },
+    Body, Client, Uri,
+};
+use once_cell::sync::OnceCell;
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    marker::PhantomData,
+    net::{SocketAddr, TcpListener as StdTcpListener},
+    pin::Pin,
+    ptr::null_mut,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Arc,
+    },
+    task,
+    task::Poll,
+    thread,
+};
+use testcontainers::{clients, images, Docker};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock},
+    runtime::Handle,
+    sync::{broadcast, oneshot, Mutex, RwLock},
+    task::{spawn_blocking, JoinHandle},
 };
 use tuzi_proxy::{
     bound::{run_with_listener, ServerAddrProvidable},
     error::TuziResult,
+    init_tracing,
+    waitgroup::WaitGroup,
+    Protocol,
 };
-use futures::Future;
-use hyper::{Body, Client, Uri};
-use once_cell::sync::OnceCell;
-use tuzi_proxy::{init_tracing, Protocol};
-use std::task::Poll;
-use hyper::client::{
-    connect::{
-        dns::{GaiResolver, Resolve},
-        http::{ConnectError, HttpConnecting},
-    },
-    HttpConnector,
-};
-use std::marker::PhantomData;
-use tokio::task::JoinHandle;
-use tokio::sync::broadcast;
-use tokio::sync::oneshot;
-use std::sync::atomic::AtomicPtr;
-use std::ptr::null_mut;
-use std::sync::atomic::Ordering;
-use tokio::task::spawn_blocking;
-use testcontainers::{clients, Docker, images};
 
 // static EXIT_SIGNAL_RX: OnceCell<oneshot::Receiver<()>> = OnceCell::new();
-static SHUTDOWN_SIGNAL_TX: OnceCell<broadcast::Sender<()>> = OnceCell::new();
-static JOIN_HANDLES_PTR: AtomicPtr<Vec<JoinHandle<()>>> = AtomicPtr::new(null_mut());
+// static SHUTDOWN_SIGNAL_TX: OnceCell<broadcast::Sender<()>> = OnceCell::new();
+// static JOIN_HANDLES_PTR: AtomicPtr<Vec<JoinHandle<()>>> = AtomicPtr::new(null_mut());
 
-pub async fn setup_servers() -> &'static Context {
-    static CONTEXT: OnceCell<Context> = OnceCell::new();
-    let context = CONTEXT.get_or_init(Default::default);
+pub async fn setup() -> (Context, Handles) {
+    init_tracing();
 
-    let b = call_once(async {
-        dbg!("call_once");
+    // let (exit_signal_tx, exit_signal_rx) = oneshot::channel();
+    // EXIT_SIGNAL_RX.set(exit_signal_rx).unwrap();
 
-        init_tracing();
+    // let (shutdown_signal_tx, mut shutdown_signal_rx) = broadcast::channel(16);
+    // SHUTDOWN_SIGNAL_TX.set(shutdown_signal_tx).unwrap();
 
-        let mut join_handles = Vec::new();
+    let mut context: Context = Default::default();
+    let (mut handles, mut shutdown_signal_rx) = Handles::new();
+    let wg = WaitGroup::new();
 
-        // let (exit_signal_tx, exit_signal_rx) = oneshot::channel();
-        // EXIT_SIGNAL_RX.set(exit_signal_rx).unwrap();
+    // proxy server
+    let proxy_listener = TcpListener::bind("localhost:0").await.unwrap();
+    context
+        .protocol_mapping
+        .insert("proxy", proxy_listener.local_addr().unwrap())
+        .await;
+    handles.server_handles.push(tokio::spawn(run_with_listener(
+        proxy_listener,
+        context.addr_mapping.clone(),
+        async move {
+            shutdown_signal_rx.recv().await.unwrap();
+            Ok(())
+        },
+    )));
 
-        let (shutdown_signal_tx, mut shutdown_signal_rx) = broadcast::channel(16);
-        SHUTDOWN_SIGNAL_TX.set(shutdown_signal_tx).unwrap();
-
-        // proxy server
-        let proxy_listener = TcpListener::bind("localhost:0").await.unwrap();
-        context
-            .protocol_mapping
-            .insert("proxy", proxy_listener.local_addr().unwrap())
-            .await;
-        join_handles.push(tokio::spawn(run_with_listener(
-            proxy_listener,
-            context.addr_mapping.clone(),
-        )));
-
-        // http server
-        let http_listener = StdTcpListener::bind("localhost:0").unwrap();
-        context
-            .protocol_mapping
-            .insert("http1", http_listener.local_addr().unwrap())
-            .await;
-        join_handles.push(tokio::spawn(http1::server(http_listener, async move {
+    // http server
+    let http_listener = StdTcpListener::bind("localhost:0").unwrap();
+    let mut shutdown_signal_rx = handles.shutdown_signal_tx.subscribe();
+    context
+        .protocol_mapping
+        .insert("http1", http_listener.local_addr().unwrap())
+        .await;
+    handles
+        .server_handles
+        .push(tokio::spawn(http1::server(http_listener, async move {
             shutdown_signal_rx.recv().await.unwrap();
         })));
 
-        // join_handles.push(spawn_blocking(|| {
-        //     let docker = clients::Cli::default();
-        //     let node = docker.run(images::redis::Redis::default());
-        //     let host_port = node.get_host_port(6379).unwrap();
-        //     let url = format!("redis://localhost:{}", host_port);
-        //     dbg!(url);
-        // }));
+    // redis server
+    let mut shutdown_signal_rx = handles.shutdown_signal_tx.subscribe();
+    let context_ = context.clone();
+    handles.server_handles.push(tokio::spawn(redis::server(
+        wg.worker(),
+        async move {
+            shutdown_signal_rx.recv().await.unwrap();
+        },
+        |addr| {
+            Box::pin(async move {
+                context_.protocol_mapping.insert("redis", addr).await;
+            })
+        },
+    )));
 
-        JOIN_HANDLES_PTR.store(Box::into_raw(Box::new(join_handles)), Ordering::SeqCst);
+    // JOIN_HANDLES_PTR.store(Box::into_raw(Box::new(join_handles)), Ordering::SeqCst);
 
-        // // wait all join handles
-        // tokio::spawn(async move {
-        //     for join_handle in join_handles {
-        //         join_handle.await.unwrap();
-        //     }
-        //     exit_signal_tx.send(()).unwrap();
-        // });
-    })
-    .await;
+    // // wait all join handles
+    // tokio::spawn(async move {
+    //     for join_handle in join_handles {
+    //         join_handle.await.unwrap();
+    //     }
+    //     exit_signal_tx.send(()).unwrap();
+    // });
 
-    if !b {
-        panic!("run servers failed");
-    }
+    wg.wait().await;
 
-    context
+    (context, handles)
 }
 
-#[tokio::test]
-async fn teardown() {
-    // SHUTDOWN_SIGNAL_TX.get().unwrap().send(()).unwrap();
-    // EXIT_SIGNAL_RX.get().unwrap().await;
+// async fn teardown() {
+// SHUTDOWN_SIGNAL_TX.get().unwrap().send(()).unwrap();
+// EXIT_SIGNAL_RX.get().unwrap().await;
 
-    // let join_handles = unsafe { Box::from_raw(JOIN_HANDLES_PTR.load(Ordering::SeqCst)) };
-    // for join_handle in join_handles.into_iter() {
-    //     join_handle.await.unwrap();
-    // }
-}
+// let join_handles = unsafe { Box::from_raw(JOIN_HANDLES_PTR.load(Ordering::SeqCst)) };
+// for join_handle in join_handles.into_iter() {
+//     join_handle.await.unwrap();
+// }
+// }
 
 pub async fn call_once(fut: impl Future<Output = ()>) -> bool {
     static START: OnceCell<Mutex<(bool, bool)>> = OnceCell::new();
@@ -127,7 +142,61 @@ pub async fn call_once(fut: impl Future<Output = ()>) -> bool {
     lock.1
 }
 
-#[derive(Default)]
+pub struct Handles {
+    server_handles: Vec<JoinHandle<()>>,
+    test_handles: Vec<JoinHandle<()>>,
+    shutdown_signal_tx: broadcast::Sender<()>,
+}
+
+impl Handles {
+    pub fn new() -> (Self, broadcast::Receiver<()>) {
+        let (shutdown_signal_tx, shutdown_signal_rx) = broadcast::channel(16);
+        (
+            Self {
+                server_handles: vec![],
+                test_handles: vec![],
+                shutdown_signal_tx,
+            },
+            shutdown_signal_rx,
+        )
+    }
+
+    pub async fn add_test(&mut self, fut: impl Future<Output = ()> + Send + 'static) {
+        self.test_handles.push(tokio::spawn(fut));
+    }
+
+    pub async fn wait(mut self) {
+        for handle in self.test_handles {
+            handle.await.unwrap();
+        }
+
+        self.shutdown_signal_tx.send(()).unwrap();
+
+        for handle in self.server_handles {
+            handle.await.unwrap();
+        }
+    }
+}
+
+impl Future for Handles {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        for handle in &mut self.test_handles {
+            ready!(Pin::new(handle).poll(cx)).unwrap();
+        }
+
+        self.shutdown_signal_tx.send(()).unwrap();
+
+        for handle in &mut self.server_handles {
+            ready!(Pin::new(handle).poll(cx)).unwrap();
+        }
+
+        Poll::Ready(())
+    }
+}
+
+#[derive(Default, Clone)]
 pub struct Context {
     pub protocol_mapping: ProtocolServerAddrMapping,
     pub addr_mapping: RealClientServerAddrMapping,
@@ -141,8 +210,8 @@ impl Context {
             .await;
     }
 
-    pub fn build_client(&'static self) -> Client<MockHttpConnector, Body> {
-        let connector = MockHttpConnector::new(self);
+    pub fn build_client(&self) -> Client<MockHttpConnector, Body> {
+        let connector = MockHttpConnector::new(self.clone());
         let client = Client::builder().build::<_, Body>(connector);
         client
     }
@@ -199,12 +268,12 @@ impl ServerAddrProvidable for RealClientServerAddrMapping {
 
 #[derive(Clone)]
 pub struct MockHttpConnector<R = GaiResolver> {
-    pub context: &'static Context,
+    pub context: Context,
     connector: HttpConnector<R>,
 }
 
 impl MockHttpConnector {
-    pub fn new(context: &'static Context) -> Self {
+    pub fn new(context: Context) -> Self {
         Self {
             context,
             connector: HttpConnector::new(),
