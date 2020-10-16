@@ -53,7 +53,7 @@ pub async fn build_aio_connection(context: Context) -> Connection {
         ActualConnection::TcpTokio(sock) => sock,
         _ => panic!("Redis connect is not tcp tokio"),
     };
-    context.add_protocol_server_port("redis", sock).await;
+    context.insert_protocol_client_port("redis", sock).await;
     conn
 }
 

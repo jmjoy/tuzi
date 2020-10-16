@@ -1,8 +1,9 @@
 pub mod http1;
 pub mod redis;
+pub mod unknown;
 
 use async_trait::async_trait;
-use futures::{ready, Future, TryFutureExt};
+use futures::{ready, Future, FutureExt, TryFutureExt};
 use hyper::{
     client::{
         connect::{
@@ -44,18 +45,8 @@ use tuzi_proxy::{
     Protocol,
 };
 
-// static EXIT_SIGNAL_RX: OnceCell<oneshot::Receiver<()>> = OnceCell::new();
-// static SHUTDOWN_SIGNAL_TX: OnceCell<broadcast::Sender<()>> = OnceCell::new();
-// static JOIN_HANDLES_PTR: AtomicPtr<Vec<JoinHandle<()>>> = AtomicPtr::new(null_mut());
-
 pub async fn setup() -> (Context, Handles) {
     init_tracing();
-
-    // let (exit_signal_tx, exit_signal_rx) = oneshot::channel();
-    // EXIT_SIGNAL_RX.set(exit_signal_rx).unwrap();
-
-    // let (shutdown_signal_tx, mut shutdown_signal_rx) = broadcast::channel(16);
-    // SHUTDOWN_SIGNAL_TX.set(shutdown_signal_tx).unwrap();
 
     let mut context: Context = Default::default();
     let (mut handles, mut shutdown_signal_rx) = Handles::new();
@@ -70,38 +61,31 @@ pub async fn setup() -> (Context, Handles) {
     handles.server_handles.push(tokio::spawn(run_with_listener(
         proxy_listener,
         context.addr_mapping.clone(),
-        async move {
-            shutdown_signal_rx.recv().await.unwrap();
-            Ok(())
-        },
+        recv_signal(shutdown_signal_rx).map(Ok),
     )));
 
     // http server
     let http_listener = StdTcpListener::bind("localhost:0").unwrap();
-    let mut shutdown_signal_rx = handles.shutdown_signal_tx.subscribe();
     context
         .protocol_mapping
         .insert("http1", http_listener.local_addr().unwrap())
         .await;
-    handles
-        .server_handles
-        .push(tokio::spawn(http1::server(http_listener, async move {
-            shutdown_signal_rx.recv().await.unwrap();
-        })));
+    handles.server_handles.push(tokio::spawn(http1::server(
+        http_listener,
+        recv_signal(handles.shutdown_signal_tx.subscribe()),
+    )));
 
     // redis server
-    let mut shutdown_signal_rx = handles.shutdown_signal_tx.subscribe();
-    let context_ = context.clone();
     handles.server_handles.push(tokio::spawn(redis::server(
         wg.worker(),
-        async move {
-            shutdown_signal_rx.recv().await.unwrap();
-        },
-        |addr| {
-            Box::pin(async move {
-                context_.protocol_mapping.insert("redis", addr).await;
-            })
-        },
+        recv_signal(handles.shutdown_signal_tx.subscribe()),
+        context.clone().protocol_server_port_inserter("redis"),
+    )));
+
+    // unknown server
+    handles.server_handles.push(tokio::spawn(unknown::server(
+        recv_signal(handles.shutdown_signal_tx.subscribe()),
+        context.clone().protocol_server_port_inserter("unknown"),
     )));
 
     // JOIN_HANDLES_PTR.store(Box::into_raw(Box::new(join_handles)), Ordering::SeqCst);
@@ -117,6 +101,10 @@ pub async fn setup() -> (Context, Handles) {
     wg.wait().await;
 
     (context, handles)
+}
+
+async fn recv_signal(mut signal: broadcast::Receiver<()>) {
+    signal.recv().await.unwrap();
 }
 
 // async fn teardown() {
@@ -203,11 +191,36 @@ pub struct Context {
 }
 
 impl Context {
-    pub async fn add_protocol_server_port<'a>(&'a self, protocol: Protocol, client: &'a TcpStream) {
+    pub async fn insert_protocol_client_port<'a>(
+        &'a self,
+        protocol: Protocol,
+        client: &'a TcpStream,
+    ) {
         let server_addr = self.protocol_mapping.get(protocol).await;
         self.addr_mapping
             .insert(client.local_addr().unwrap(), server_addr)
             .await;
+    }
+
+    pub async fn insert_protocol_server_port<'a>(
+        &'a self,
+        protocol: Protocol,
+        server: &'a TcpStream,
+    ) {
+        self.protocol_mapping
+            .insert(protocol, server.local_addr().unwrap())
+            .await;
+    }
+
+    fn protocol_server_port_inserter(
+        self,
+        protocol: Protocol,
+    ) -> impl FnOnce(SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        move |addr| {
+            Box::pin(async move {
+                self.protocol_mapping.insert(protocol, addr).await;
+            })
+        }
     }
 
     pub fn build_client(&self) -> Client<MockHttpConnector, Body> {
@@ -300,7 +313,10 @@ where
             fut: Box::pin(async move {
                 let sock = self_.connector.call_async(dst).await;
                 if let Ok(sock) = &sock {
-                    self_.context.add_protocol_server_port("http1", sock).await;
+                    self_
+                        .context
+                        .insert_protocol_client_port("http1", sock)
+                        .await;
                 }
                 sock
             }),
