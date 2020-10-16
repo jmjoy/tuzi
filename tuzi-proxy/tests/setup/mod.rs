@@ -165,7 +165,7 @@ impl Handles {
         self.test_handles.push(tokio::spawn(fut));
     }
 
-    pub async fn wait(mut self) {
+    pub async fn wait(self) {
         for handle in self.test_handles {
             handle.await.unwrap();
         }

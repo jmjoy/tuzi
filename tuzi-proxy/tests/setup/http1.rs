@@ -1,3 +1,4 @@
+use crate::setup::Context;
 use http::Method;
 use hyper::{
     service::{make_service_fn, service_fn},
@@ -6,7 +7,6 @@ use hyper::{
 use std::{convert::Infallible, future::Future, net::TcpListener as StdTcpListener};
 use tokio::sync::oneshot;
 use tracing::{debug, instrument};
-use crate::setup::Context;
 
 #[instrument(name = "test-server-http1:handle", skip(req))]
 async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {

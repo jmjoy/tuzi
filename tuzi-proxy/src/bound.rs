@@ -36,8 +36,10 @@ use tokio::{
 use tracing::{debug, info, instrument};
 
 fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
-    let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
-        &[Arc::new(http1::Parser), Arc::new(redis::Parser)];
+    let protocol_parsers: &[Arc<dyn ProtocolParsable>] = &[
+        Arc::new(http1::Parser),
+        // Arc::new(redis::Parser)
+    ];
     let protocol_parsers = protocol_parsers
         .iter()
         .map(|parser| (parser.protocol(), parser.clone()))
@@ -125,7 +127,7 @@ pub async fn run_with_listener(
     wg.wait().await;
 }
 
-#[instrument(name = "bound:handle", skip(socket, context))]
+#[instrument(skip(socket, context))]
 async fn handle(
     peer: SocketAddr,
     orig_dst: SocketAddr,
@@ -148,6 +150,8 @@ async fn handle(
     let mut handles = Vec::new();
 
     handles.push(tokio::spawn(client_to_proxy(
+        peer.clone(),
+        orig_dst.clone(),
         socket_read,
         client_to_proxy_delivery,
     )));
@@ -175,12 +179,16 @@ async fn handle(
     }
 
     handles.push(tokio::spawn(proxy_to_server(
+        peer.clone(),
+        orig_dst.clone(),
         context.protocol_parsers.keys().map(|p| *p).collect(),
         orig_write,
         proxy_to_server_delivery,
     )));
 
     handles.push(tokio::spawn(server_to_proxy(
+        peer.clone(),
+        orig_dst.clone(),
         context.protocol_parsers.clone(),
         orig_read,
         socket_write,
@@ -200,7 +208,13 @@ async fn handle(
     Ok(())
 }
 
-async fn client_to_proxy(mut socket_read: OwnedReadHalf, delivery: ClientToProxyDelivery) {
+#[instrument(skip(socket_read, delivery))]
+async fn client_to_proxy(
+    client: SocketAddr,
+    server: SocketAddr,
+    mut socket_read: OwnedReadHalf,
+    delivery: ClientToProxyDelivery,
+) {
     let mut buf = [0; 4096];
     let mut copied = 0;
 
@@ -219,7 +233,10 @@ async fn client_to_proxy(mut socket_read: OwnedReadHalf, delivery: ClientToProxy
     }
 }
 
+#[instrument(skip(protocols, orig_write, delivery))]
 async fn proxy_to_server(
+    client: SocketAddr,
+    server: SocketAddr,
     mut protocols: HashSet<Protocol>,
     mut orig_write: OwnedWriteHalf,
     mut delivery: ProxyToServerDelivery,
@@ -229,6 +246,7 @@ async fn proxy_to_server(
 
     loop {
         if protocols.is_empty() {
+            delivery.response_protocol_sender.send(None).await.unwrap();
             break;
         }
 
@@ -244,6 +262,8 @@ async fn proxy_to_server(
                 debug!(data.protocol, "request_parsed_receiver, recv");
                 match data.content {
                     RequestParsedContent::Content(_content) => {
+                        todo!();
+
                         detect_protocol(
                             &mut protocol,
                             data.protocol,
@@ -286,12 +306,17 @@ async fn proxy_to_server(
         }
     }
 
+    debug!("raw or failed, pre-read content size: {}", content.len());
+
     if !content.is_empty() {
         let n = orig_write.write(&content).await.unwrap();
         if n == 0 {
             todo!("Write zero");
         }
     }
+
+    debug!("pre-read content written");
+
     receive_copy(&mut delivery.request_raw_receiver, &mut orig_write)
         .await
         .unwrap();
@@ -318,7 +343,10 @@ async fn detect_protocol<'a>(
     Ok(())
 }
 
+#[instrument(skip(protocol_parsers, server_read, client_write, delivery))]
 async fn server_to_proxy(
+    client: SocketAddr,
+    server: SocketAddr,
     protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>,
     mut server_read: OwnedReadHalf,
     mut client_write: OwnedWriteHalf,

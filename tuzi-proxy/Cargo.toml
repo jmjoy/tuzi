@@ -27,4 +27,5 @@ tracing-subscriber = "0.2.12"
 
 [dev-dependencies]
 hyper = { git = "https://github.com/jmjoy/hyper.git", branch = "v0.13.8-hack" }
+redis = { git = "https://github.com/jmjoy/redis-rs.git", branch = "0.17.0-hack", features = ["tokio-comp"] }
 testcontainers = "0.11.0"
