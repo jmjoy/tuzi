@@ -16,6 +16,9 @@ use nom::{
 use std::str;
 use tokio::io::{copy, AsyncWriteExt};
 use tracing::info;
+use std::sync::Once;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 pub struct Parser;
 
@@ -27,24 +30,32 @@ impl ProtocolParsable for Parser {
 
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()> {
         let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.request_raw_receiver);
-        let count = parser.parse_and_recv(args_count).await?;
-        info!(count, "redis args count");
+        let sent = AtomicBool::new(false);
 
-        let mut args = Vec::new();
-        for _ in 0..count {
-            let arg = parser.parse_and_recv(req_arg).await?;
-            args.push(arg);
+        loop {
+            let count = parser.parse_and_recv(args_count).await?;
+            info!(count, "redis args count");
+
+            let mut args = Vec::new();
+            for _ in 0..count {
+                let arg = parser.parse_and_recv(req_arg).await?;
+                args.push(arg);
+            }
+            info!(?args, "redis arg: ");
+
+            if !sent.load(Ordering::SeqCst) {
+                sent.store(true, Ordering::SeqCst);
+
+                delivery
+                    .request_parsed_sender
+                    .send(RequestParsedData {
+                        protocol: self.protocol(),
+                        content: RequestParsedContent::Raw,
+                    })
+                    .await
+                    .unwrap();
+            }
         }
-        info!(?args, "redis arg: ");
-
-        delivery
-            .request_parsed_sender
-            .send(RequestParsedData {
-                protocol: self.protocol(),
-                content: RequestParsedContent::Raw,
-            })
-            .await
-            .unwrap();
 
         Ok(())
     }
