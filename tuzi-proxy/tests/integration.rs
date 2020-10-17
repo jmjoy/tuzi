@@ -3,7 +3,6 @@ mod setup;
 use crate::setup::{http1, redis, setup, unknown, Context};
 use http::{Method, Request};
 use hyper::body;
-use nom::lib::std::alloc::handle_alloc_error;
 use std::thread;
 use tokio::time::delay_for;
 

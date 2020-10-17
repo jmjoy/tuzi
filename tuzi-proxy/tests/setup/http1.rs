@@ -26,9 +26,7 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
 
 pub async fn server(listener: StdTcpListener, signal: impl Future<Output = ()>) {
     let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle)) });
-
     let server = Server::from_tcp(listener).unwrap().serve(make_svc);
-
     server.with_graceful_shutdown(signal).await.unwrap();
 }
 

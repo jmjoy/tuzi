@@ -2,8 +2,8 @@ use crate::{
     error::{TuziError, TuziResult},
     parse::{
         delivery, http1, receive_copy, redis, ClientToProxyDelivery, Protocol, ProtocolParsable,
-        ProxyToServerDelivery, RequestParsedContent, RequestParsedData, ResponseParserDelivery,
-        ResponseParserReader, ServerToProxyDelivery,
+        ProxyToServerDelivery, RequestParsedContent, RequestParsedData, RequestParserDelivery,
+        ResponseParserDelivery, ResponseParserReader, ServerToProxyDelivery,
     },
     tcp::orig_dst_addr,
     waitgroup::WaitGroup,
@@ -36,10 +36,8 @@ use tokio::{
 use tracing::{debug, info, instrument};
 
 fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
-    let protocol_parsers: &[Arc<dyn ProtocolParsable>] = &[
-        Arc::new(http1::Parser),
-        // Arc::new(redis::Parser)
-    ];
+    let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
+        &[Arc::new(http1::Parser), Arc::new(redis::Parser)];
     let protocol_parsers = protocol_parsers
         .iter()
         .map(|parser| (parser.protocol(), parser.clone()))
@@ -159,23 +157,12 @@ async fn handle(
     for (_, protocol_parser) in context.protocol_parsers.iter() {
         let delivery = parser_deliveries.pop().unwrap();
         let protocol_parser = protocol_parser.clone();
-        handles.push(tokio::spawn(async move {
-            let mut request_parsed_sender = delivery.request_parsed_sender.clone();
-            if let Err(e) = protocol_parser.parse_request(delivery).await {
-                match e {
-                    TuziError::Nom(_) => {
-                        request_parsed_sender
-                            .send(RequestParsedData {
-                                protocol: protocol_parser.protocol(),
-                                content: RequestParsedContent::Failed,
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    e => panic!(e),
-                }
-            }
-        }));
+        handles.push(tokio::spawn(parser(
+            peer.clone(),
+            orig_dst.clone(),
+            delivery,
+            protocol_parser,
+        )));
     }
 
     handles.push(tokio::spawn(proxy_to_server(
@@ -230,6 +217,30 @@ async fn client_to_proxy(
         let content = (&buf[..n]).to_owned();
         debug!("request_sender {:?}", Some(content.len()));
         delivery.request_raw_sender.send(Some(content)).unwrap();
+    }
+}
+
+#[instrument(skip(delivery, protocol_parser))]
+async fn parser(
+    client: SocketAddr,
+    server: SocketAddr,
+    delivery: RequestParserDelivery,
+    protocol_parser: Arc<dyn ProtocolParsable>,
+) {
+    let mut request_parsed_sender = delivery.request_parsed_sender.clone();
+    if let Err(e) = protocol_parser.parse_request(delivery).await {
+        match e {
+            TuziError::Nom(_) => {
+                request_parsed_sender
+                    .send(RequestParsedData {
+                        protocol: protocol_parser.protocol(),
+                        content: RequestParsedContent::Failed,
+                    })
+                    .await
+                    .unwrap();
+            }
+            e => panic!(e),
+        }
     }
 }
 

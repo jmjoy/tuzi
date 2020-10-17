@@ -7,13 +7,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use nom::{
-    bytes::streaming::tag,
+    bytes::streaming::{tag, take},
     character::streaming::{crlf, digit1},
     combinator::map,
-    sequence::delimited,
+    sequence::{delimited, terminated},
     IResult,
 };
 use std::str;
+use tokio::io::{copy, AsyncWriteExt};
 use tracing::info;
 
 pub struct Parser;
@@ -28,19 +29,34 @@ impl ProtocolParsable for Parser {
         let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.request_raw_receiver);
         let count = parser.parse_and_recv(args_count).await?;
         info!(count, "redis args count");
+
+        let mut args = Vec::new();
+        for _ in 0..count {
+            let arg = parser.parse_and_recv(req_arg).await?;
+            args.push(arg);
+        }
+        info!(?args, "redis arg: ");
+
         delivery
             .request_parsed_sender
             .send(RequestParsedData {
                 protocol: self.protocol(),
-                content: RequestParsedContent::Failed,
+                content: RequestParsedContent::Raw,
             })
             .await
             .unwrap();
+
         Ok(())
     }
 
-    async fn parse_response(&self, _delivery: ResponseParserDelivery) -> TuziResult<()> {
-        unimplemented!()
+    async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
+        if let Some(content) = delivery.reader.exists_content {
+            delivery.client_write.write(&content).await.unwrap();
+        }
+        copy(&mut delivery.reader.server_read, &mut delivery.client_write)
+            .await
+            .unwrap();
+        Ok(())
     }
 }
 
@@ -50,4 +66,19 @@ fn args_count(input: &[u8]) -> IResult<&[u8], usize> {
         map(digit1, |s| str::from_utf8(s).unwrap().parse().unwrap()),
         crlf,
     )(input)
+}
+
+fn req_arg(input: &[u8]) -> IResult<&[u8], String> {
+    let (input, len) = delimited(
+        tag("$"),
+        map(digit1, |s| {
+            str::from_utf8(s).unwrap().parse::<usize>().unwrap()
+        }),
+        crlf,
+    )(input)?;
+
+    let (input, arg) = terminated(take(len), crlf)(input)?;
+    let arg = str::from_utf8(arg).unwrap().to_owned();
+
+    Ok((input, arg))
 }
