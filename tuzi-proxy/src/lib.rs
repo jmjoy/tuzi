@@ -8,9 +8,9 @@ pub mod wait;
 
 pub use crate::parse::Protocol;
 
+use crate::bound::outbound;
 use clap::Clap;
 use std::{net::SocketAddr, rc::Rc};
-use crate::bound::outbound;
 
 #[derive(Debug, Clap)]
 pub struct Configuration {

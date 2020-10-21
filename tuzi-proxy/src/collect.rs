@@ -1,9 +1,7 @@
-use nom::lib::std::collections::LinkedList;
 use crate::Protocol;
 use indexmap::map::IndexMap;
-use std::time::Duration;
-use std::net::SocketAddr;
-use std::collections::HashMap;
+use nom::lib::std::collections::LinkedList;
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 pub trait Collectable {
     fn collect(&mut self, record: Record);
@@ -36,4 +34,3 @@ impl Collection {
         self.outbounds.push_back(record);
     }
 }
-

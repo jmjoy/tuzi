@@ -7,20 +7,22 @@ use crate::{
 };
 use async_trait::async_trait;
 use nom::{
-    bytes::streaming::{tag, take},
+    branch::alt,
+    bytes::streaming::{is_not, tag, take},
     character::streaming::{crlf, digit1},
     combinator::map,
     sequence::{delimited, terminated},
     IResult,
 };
-use std::str;
+use std::{
+    str,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Once,
+    },
+};
 use tokio::io::{copy, AsyncWriteExt};
 use tracing::info;
-use std::sync::Once;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use nom::bytes::streaming::is_not;
-use nom::branch::alt;
 
 pub struct Parser;
 
@@ -36,14 +38,14 @@ impl ProtocolParsable for Parser {
 
         loop {
             let count = parser.parse_and_recv(args_count).await?;
-            info!(count, "redis args count");
 
             let mut args = Vec::new();
             for _ in 0..count {
                 let arg = parser.parse_and_recv(req_arg).await?;
                 args.push(arg);
             }
-            info!(?args, "redis arg: ");
+
+            info!(?count, ?args, "redis request");
 
             if !sent.load(Ordering::SeqCst) {
                 sent.store(true, Ordering::SeqCst);
@@ -63,13 +65,22 @@ impl ProtocolParsable for Parser {
     }
 
     async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
-        let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.reader);
-        let (success, text) = parser.parse_and_recv(alt((resp_simple, resp_error))).await?;
-        if parser.recv_content_ref().is_empty()
+        let mut parser = ReceiveParser::new(
+            delivery.reader.exists_content.clone().unwrap_or_default(),
+            &mut delivery.reader,
+        );
+        let (success, text) = parser.parse_and_recv(resp).await?;
 
-        if let Some(content) = delivery.reader.exists_content {
-            delivery.client_write.write(&content).await.unwrap();
+        info!(?success, ?text, "redis response");
+
+        if !parser.recv_content_ref().is_empty() {
+            delivery
+                .client_write
+                .write(parser.recv_content_ref())
+                .await
+                .unwrap();
         }
+
         copy(&mut delivery.reader.server_read, &mut delivery.client_write)
             .await
             .unwrap();
@@ -100,18 +111,18 @@ fn req_arg(input: &[u8]) -> IResult<&[u8], String> {
     Ok((input, arg))
 }
 
-fn resp_simple(input: &[u8]) -> IResult<&[u8], (bool, &[u8])> {
-    map(delimited(
-        tag("+"),
-        is_not("\r\n"),
-        crlf,
-    ), |s| (true, s))(input)
+fn resp(input: &[u8]) -> IResult<&[u8], (bool, String)> {
+    alt((resp_simple, resp_error))(input)
 }
 
-fn resp_error(input: &[u8]) -> IResult<&[u8], (bool, &[u8])> {
-    map(delimited(
-        tag("-"),
-        is_not("\r\n"),
-        crlf,
-    ), |s| (false, s))(input)
+fn resp_simple(input: &[u8]) -> IResult<&[u8], (bool, String)> {
+    map(delimited(tag("+"), is_not("\r\n"), crlf), |s: &[u8]| {
+        (true, String::from_utf8(s.to_vec()).unwrap())
+    })(input)
+}
+
+fn resp_error(input: &[u8]) -> IResult<&[u8], (bool, String)> {
+    map(delimited(tag("-"), is_not("\r\n"), crlf), |s: &[u8]| {
+        (false, String::from_utf8(s.to_vec()).unwrap())
+    })(input)
 }
