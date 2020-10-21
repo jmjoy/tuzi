@@ -41,7 +41,7 @@ use tuzi_proxy::{
     bound::{run_with_listener, ServerAddrProvidable},
     error::TuziResult,
     init_tracing,
-    waitgroup::WaitGroup,
+    wait::WaitGroup,
     Protocol,
 };
 

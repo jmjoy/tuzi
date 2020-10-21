@@ -19,6 +19,8 @@ use tracing::info;
 use std::sync::Once;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use nom::bytes::streaming::is_not;
+use nom::branch::alt;
 
 pub struct Parser;
 
@@ -61,6 +63,10 @@ impl ProtocolParsable for Parser {
     }
 
     async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()> {
+        let mut parser = ReceiveParser::new(Vec::new(), &mut delivery.reader);
+        let (success, text) = parser.parse_and_recv(alt((resp_simple, resp_error))).await?;
+        if parser.recv_content_ref().is_empty()
+
         if let Some(content) = delivery.reader.exists_content {
             delivery.client_write.write(&content).await.unwrap();
         }
@@ -92,4 +98,20 @@ fn req_arg(input: &[u8]) -> IResult<&[u8], String> {
     let arg = str::from_utf8(arg).unwrap().to_owned();
 
     Ok((input, arg))
+}
+
+fn resp_simple(input: &[u8]) -> IResult<&[u8], (bool, &[u8])> {
+    map(delimited(
+        tag("+"),
+        is_not("\r\n"),
+        crlf,
+    ), |s| (true, s))(input)
+}
+
+fn resp_error(input: &[u8]) -> IResult<&[u8], (bool, &[u8])> {
+    map(delimited(
+        tag("-"),
+        is_not("\r\n"),
+        crlf,
+    ), |s| (false, s))(input)
 }

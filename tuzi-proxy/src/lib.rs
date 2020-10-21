@@ -1,15 +1,16 @@
 pub mod bound;
+pub mod collect;
 pub mod error;
-mod inbound;
-mod outbound;
-mod parse;
-mod tcp;
-pub mod waitgroup;
+pub mod io;
+pub mod parse;
+pub mod tcp;
+pub mod wait;
 
 pub use crate::parse::Protocol;
 
 use clap::Clap;
 use std::{net::SocketAddr, rc::Rc};
+use crate::bound::outbound;
 
 #[derive(Debug, Clap)]
 pub struct Configuration {
@@ -27,6 +28,6 @@ pub async fn run(configuration: Configuration) -> anyhow::Result<()> {
     let configuration = Rc::new(configuration);
 
     // tokio::try_join!(inbound(), outbound())?;
-    outbound::run(configuration).await;
+    outbound(configuration).await;
     Ok(())
 }

@@ -1,13 +1,8 @@
-use crate::{
-    error::{TuziError, TuziResult},
-    parse::{
-        delivery, http1, receive_copy, redis, ClientToProxyDelivery, Protocol, ProtocolParsable,
-        ProxyToServerDelivery, RequestParsedContent, RequestParsedData, RequestParserDelivery,
-        ResponseParserDelivery, ResponseParserReader, ServerToProxyDelivery,
-    },
-    tcp::orig_dst_addr,
-    waitgroup::WaitGroup,
-};
+use crate::{error::{TuziError, TuziResult}, parse::{
+    delivery, http1, receive_copy, redis, ClientToProxyDelivery, Protocol, ProtocolParsable,
+    ProxyToServerDelivery, RequestParsedContent, RequestParsedData, RequestParserDelivery,
+    ResponseParserDelivery, ResponseParserReader, ServerToProxyDelivery,
+}, tcp::orig_dst_addr, wait::WaitGroup, Configuration};
 use async_trait::async_trait;
 use futures::{
     future::{select, Either},
@@ -34,6 +29,8 @@ use tokio::{
     time::delay_for,
 };
 use tracing::{debug, info, instrument};
+use std::rc::Rc;
+use tokio::signal::ctrl_c;
 
 fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
     let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
@@ -43,6 +40,21 @@ fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
         .map(|parser| (parser.protocol(), parser.clone()))
         .collect();
     Arc::new(protocol_parsers)
+}
+
+pub enum Bound {
+    inbound,
+    outbound,
+}
+
+#[instrument]
+pub async fn outbound(configuration: Rc<Configuration>) {
+    let listener = TcpListener::bind(configuration.outbound).await.unwrap();
+    run_with_listener(listener, OriginalDst, async {
+        ctrl_c().await.unwrap();
+        Ok(())
+    })
+        .await;
 }
 
 struct Context {

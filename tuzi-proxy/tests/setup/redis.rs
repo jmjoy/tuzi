@@ -11,7 +11,7 @@ use std::{
 };
 use testcontainers::{clients, images, Docker};
 use tokio::{sync::oneshot, task::spawn_blocking};
-use tuzi_proxy::waitgroup::{WaitGroup, Worker};
+use tuzi_proxy::wait::{WaitGroup, Worker};
 
 pub async fn server(
     worker: Worker,
