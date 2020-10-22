@@ -2,9 +2,20 @@ use crate::Protocol;
 use indexmap::map::IndexMap;
 use nom::lib::std::collections::LinkedList;
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use async_trait::async_trait;
 
-pub trait Collectable {
-    fn collect(&mut self, record: Record);
+#[async_trait]
+pub trait Collectable: Send + Sync {
+    async fn collect(&mut self, record: Record);
+}
+
+pub struct StdoutCollector;
+
+#[async_trait]
+impl Collectable for StdoutCollector {
+    async fn collect(&mut self, record: Record) {
+        println!("{:?}", record);
+    }
 }
 
 #[derive(Debug)]

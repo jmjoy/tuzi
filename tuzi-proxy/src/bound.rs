@@ -38,10 +38,13 @@ use tokio::{
     time::delay_for,
 };
 use tracing::{debug, info, instrument};
+use crate::collect::StdoutCollector;
 
-fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
+async fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
+    let collector = Arc::new(StdoutCollector);
+
     let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
-        &[Arc::new(http1::Parser), Arc::new(redis::Parser)];
+        &[Arc::new(http1::Parser), Arc::new(redis::Parser::new(collector).await)];
     let protocol_parsers = protocol_parsers
         .iter()
         .map(|parser| (parser.protocol(), parser.clone()))
@@ -101,7 +104,7 @@ pub async fn run_with_listener(
     let wg = WaitGroup::new();
     let worker = wg.worker();
 
-    let protocol_parsers = new_protocol_parsers();
+    let protocol_parsers = new_protocol_parsers().await;
 
     let (mut shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 

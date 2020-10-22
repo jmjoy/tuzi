@@ -23,8 +23,46 @@ use std::{
 };
 use tokio::io::{copy, AsyncWriteExt};
 use tracing::info;
+use std::sync::Arc;
+use crate::collect::{Collectable, Record};
+use tokio::sync::mpsc;
 
-pub struct Parser;
+enum ReqOrResp {
+    Req(Request),
+    Resp(Response),
+}
+
+struct Request {
+    command: String,
+}
+
+struct Response {
+    success: bool,
+    result: String,
+}
+
+pub struct Collector {
+    collectable: Arc<dyn Collectable>,
+    receiver: mpsc::Receiver<ReqOrResp>,
+}
+
+pub struct Parser {
+    collect_sender: mpsc::Sender<ReqOrResp>,
+}
+
+impl Parser {
+    pub async fn new(collectable: Arc<dyn Collectable>) -> Self {
+        let (sender, receiver) = mpsc::channel(16);
+        let collector = Collector {
+            collectable,
+            receiver,
+        };
+        // tokio::spawn()
+        Self {
+            collect_sender: sender,
+        }
+    }
+}
 
 #[async_trait]
 impl ProtocolParsable for Parser {
