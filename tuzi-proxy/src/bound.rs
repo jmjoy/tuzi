@@ -102,42 +102,45 @@ pub async fn run_with_listener(
     signal: impl Future<Output = TuziResult<()>>,
 ) {
     let wg = WaitGroup::new();
-    let worker = wg.worker();
 
     let protocol_parsers = new_protocol_parsers().await;
 
     let (mut shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
-    let join = tokio::spawn(async move {
-        loop {
-            let providable = providable.clone();
 
-            let shutdown_fut = shutdown_rx.recv();
-            let listener_fut = listener.accept();
-            pin_mut!(shutdown_fut, listener_fut);
+    let join = {
+        let wg = wg.clone();
+        tokio::spawn(async move {
+            loop {
+                let providable = providable.clone();
 
-            match select(shutdown_fut, listener_fut).await {
-                Either::Left((r, _)) => {
-                    debug!("shutdown_rx recv");
-                    break;
-                }
-                Either::Right((r, _)) => {
-                    let (socket, _) = r.unwrap();
-                    let worker = worker.clone();
+                let shutdown_fut = shutdown_rx.recv();
+                let listener_fut = listener.accept();
+                pin_mut!(shutdown_fut, listener_fut);
 
-                    let protocol_parsers = protocol_parsers.clone();
-                    let context = Context::new(protocol_parsers);
+                match select(shutdown_fut, listener_fut).await {
+                    Either::Left((r, _)) => {
+                        debug!("shutdown_rx recv");
+                        break;
+                    }
+                    Either::Right((r, _)) => {
+                        let (socket, _) = r.unwrap();
+                        let wg = wg.clone();
 
-                    tokio::spawn(async move {
-                        let peer = socket.peer_addr().unwrap();
-                        let orig_dst = providable.provide_server_addr(&socket).await.unwrap();
-                        handle(peer, orig_dst, socket, context).await.unwrap();
-                        drop(worker);
-                    });
+                        let protocol_parsers = protocol_parsers.clone();
+                        let context = Context::new(protocol_parsers);
+
+                        tokio::spawn(async move {
+                            let peer = socket.peer_addr().unwrap();
+                            let orig_dst = providable.provide_server_addr(&socket).await.unwrap();
+                            handle(peer, orig_dst, socket, context).await.unwrap();
+                            drop(wg);
+                        });
+                    }
                 }
             }
-        }
-    });
+        })
+    };
 
     signal.await.unwrap();
     debug!("signal received, starting graceful shutdown");

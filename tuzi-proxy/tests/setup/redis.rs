@@ -11,10 +11,10 @@ use std::{
 };
 use testcontainers::{clients, images, Docker};
 use tokio::{sync::oneshot, task::spawn_blocking};
-use tuzi_proxy::wait::{WaitGroup, Worker};
+use tuzi_proxy::wait::WaitGroup;
 
 pub async fn server(
-    worker: Worker,
+    wg: WaitGroup,
     signal: impl Future<Output = ()>,
     addr_fn: impl FnOnce(SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send>>,
 ) {
@@ -38,7 +38,7 @@ pub async fn server(
 
     let addr = addr_rx.await.unwrap();
     addr_fn(addr).await;
-    drop(worker);
+    drop(wg);
 
     signal.await;
     shutdown_tx.send(()).unwrap();

@@ -77,7 +77,7 @@ pub async fn setup() -> (Context, Handles) {
 
     // redis server
     handles.server_handles.push(tokio::spawn(redis::server(
-        wg.worker(),
+        wg.clone(),
         recv_signal(handles.shutdown_signal_tx.subscribe()),
         context.clone().protocol_server_port_inserter("redis"),
     )));

@@ -6,12 +6,8 @@ use std::{
     task::{Context, Poll},
 };
 
-pub struct WaitGroup {
-    inner: Arc<Inner>,
-}
-
 #[derive(Clone)]
-pub struct Worker {
+pub struct WaitGroup {
     inner: Arc<Inner>,
 }
 
@@ -35,12 +31,6 @@ impl WaitGroup {
             inner: Arc::new(Inner {
                 waker: AtomicWaker::new(),
             }),
-        }
-    }
-
-    pub fn worker(&self) -> Worker {
-        Worker {
-            inner: self.inner.clone(),
         }
     }
 
@@ -80,9 +70,9 @@ mod tests {
         let wg = WaitGroup::new();
 
         for _ in 0..100 {
-            let w = wg.worker();
+            let wg = wg.clone();
             tokio::spawn(async move {
-                drop(w);
+                drop(wg);
             });
         }
 
