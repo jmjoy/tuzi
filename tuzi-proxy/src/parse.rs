@@ -8,7 +8,7 @@ use crate::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use nom::{IResult, Needed};
-use std::{io, mem::replace};
+use std::{io, mem::replace, net::SocketAddr};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -42,6 +42,8 @@ pub struct ClientToProxyDelivery {
 pub struct RequestParserDelivery {
     pub request_raw_receiver: broadcast::Receiver<Option<Vec<u8>>>,
     pub request_parsed_sender: mpsc::Sender<RequestParsedData>,
+    pub client_addr: SocketAddr,
+    pub server_addr: SocketAddr,
 }
 
 pub struct ProxyToServerDelivery {
@@ -56,6 +58,8 @@ pub struct ServerToProxyDelivery {
 
 pub fn delivery(
     count: usize,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
 ) -> (
     ClientToProxyDelivery,
     Vec<RequestParserDelivery>,
@@ -74,6 +78,8 @@ pub fn delivery(
         parser_deliveries.push(RequestParserDelivery {
             request_raw_receiver: request_raw_sender.subscribe(),
             request_parsed_sender: request_parsed_sender.clone(),
+            client_addr,
+            server_addr,
         });
     }
 

@@ -1,4 +1,5 @@
 use crate::{
+    collect::StdoutCollector,
     error::{TuziError, TuziResult},
     io::receive_copy,
     parse::{
@@ -38,13 +39,14 @@ use tokio::{
     time::delay_for,
 };
 use tracing::{debug, info, instrument};
-use crate::collect::StdoutCollector;
 
-async fn new_protocol_parsers() -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
-    let collector = Arc::new(StdoutCollector);
+async fn new_protocol_parsers(wg: WaitGroup) -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
+    let collector = Arc::new(StdoutCollector::new("==> "));
 
-    let protocol_parsers: &[Arc<dyn ProtocolParsable>] =
-        &[Arc::new(http1::Parser), Arc::new(redis::Parser::new(collector).await)];
+    let protocol_parsers: &[Arc<dyn ProtocolParsable>] = &[
+        Arc::new(http1::Parser),
+        Arc::new(redis::Parser::new(collector, wg).await),
+    ];
     let protocol_parsers = protocol_parsers
         .iter()
         .map(|parser| (parser.protocol(), parser.clone()))
@@ -103,10 +105,9 @@ pub async fn run_with_listener(
 ) {
     let wg = WaitGroup::new();
 
-    let protocol_parsers = new_protocol_parsers().await;
+    let protocol_parsers = new_protocol_parsers(wg.clone()).await;
 
     let (mut shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-
 
     let join = {
         let wg = wg.clone();
@@ -152,12 +153,12 @@ pub async fn run_with_listener(
 
 #[instrument(skip(socket, context))]
 async fn handle(
-    peer: SocketAddr,
-    orig_dst: SocketAddr,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
     socket: TcpStream,
     context: Context,
 ) -> anyhow::Result<()> {
-    let orig = TcpStream::connect(orig_dst).await.unwrap();
+    let orig = TcpStream::connect(server_addr).await.unwrap();
     debug!("after connect to orig_dst");
 
     let (socket_read, socket_write) = socket.into_split();
@@ -168,13 +169,13 @@ async fn handle(
         mut parser_deliveries,
         proxy_to_server_delivery,
         server_to_proxy_delivery,
-    ) = delivery(context.protocol_parsers.len());
+    ) = delivery(context.protocol_parsers.len(), client_addr, server_addr);
 
     let mut handles = Vec::new();
 
     handles.push(tokio::spawn(client_to_proxy(
-        peer.clone(),
-        orig_dst.clone(),
+        client_addr.clone(),
+        server_addr.clone(),
         socket_read,
         client_to_proxy_delivery,
     )));
@@ -183,24 +184,24 @@ async fn handle(
         let delivery = parser_deliveries.pop().unwrap();
         let protocol_parser = protocol_parser.clone();
         handles.push(tokio::spawn(parser(
-            peer.clone(),
-            orig_dst.clone(),
+            client_addr.clone(),
+            server_addr.clone(),
             delivery,
             protocol_parser,
         )));
     }
 
     handles.push(tokio::spawn(proxy_to_server(
-        peer.clone(),
-        orig_dst.clone(),
+        client_addr.clone(),
+        server_addr.clone(),
         context.protocol_parsers.keys().map(|p| *p).collect(),
         orig_write,
         proxy_to_server_delivery,
     )));
 
     handles.push(tokio::spawn(server_to_proxy(
-        peer.clone(),
-        orig_dst.clone(),
+        client_addr.clone(),
+        server_addr.clone(),
         context.protocol_parsers.clone(),
         orig_read,
         socket_write,
