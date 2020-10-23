@@ -18,6 +18,7 @@ use tokio::{
     },
 };
 use tracing::debug;
+use tokio::task::JoinHandle;
 
 pub type Protocol = &'static str;
 
@@ -110,6 +111,7 @@ pub struct ResponseParserDelivery {
 #[async_trait]
 pub trait ProtocolParsable: Send + Sync {
     fn protocol(&self) -> Protocol;
+    fn daemon(&self) -> Option<JoinHandle<()>>;
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()>;
     async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()>;
 }

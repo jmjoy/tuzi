@@ -33,6 +33,8 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 use tracing::info;
+use nom::error::context;
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 enum CollectMeta {
@@ -83,9 +85,9 @@ impl Collector {
                     None => sess_request = Some(request),
                 },
                 CollectMeta::Response(response) => match sess_request {
-                    Some(ref sess_request) => {
+                    Some(ref request) => {
                         let mut request_tags = HashMap::new();
-                        request_tags.insert("params".to_string(), sess_request.command.clone());
+                        request_tags.insert("params".to_string(), request.command.clone());
 
                         let mut response_tags = HashMap::new();
                         response_tags.insert("result".to_string(), response.result.clone());
@@ -93,7 +95,7 @@ impl Collector {
                         let record = Record {
                             protocol: self.protocol,
                             success: response.success,
-                            start_time: sess_request.now,
+                            start_time: request.now,
                             end_time: response.now,
                             client_addr: sess_addrs.as_ref().unwrap().client_addr.clone(),
                             server_addr: sess_addrs.as_ref().unwrap().server_addr.clone(),
@@ -103,6 +105,8 @@ impl Collector {
                         };
 
                         self.collectable.collect(record).await;
+
+                        sess_request = None;
                     }
                     None => panic!("No pre request"),
                 },
@@ -121,19 +125,10 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub async fn new(collectable: Arc<dyn Collectable>, wg: WaitGroup) -> Self {
-        let (sender, receiver) = mpsc::channel(16);
-        let parser = Self {
+    pub fn new(collectable: Arc<dyn Collectable>) -> Self {
+        Self {
             collect_sender: Mutex::new(sender),
-        };
-        let collector = Collector {
-            protocol: parser.protocol(),
-            collectable,
-            receiver,
-            wg,
-        };
-        tokio::spawn(collector.listening());
-        parser
+        }
     }
 }
 
@@ -141,6 +136,17 @@ impl Parser {
 impl ProtocolParsable for Parser {
     fn protocol(&self) -> &'static str {
         "redis"
+    }
+
+    fn daemon(&self) -> Option<JoinHandle<()>> {
+        let (sender, receiver) = mpsc::channel(16);
+        let collector = Collector {
+            protocol: parser.protocol(),
+            collectable,
+            receiver,
+            wg,
+        };
+        let handle = tokio::spawn(collector.listening());
     }
 
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()> {
@@ -206,11 +212,23 @@ impl ProtocolParsable for Parser {
         loop {
             let now = SystemTime::now();
 
-            let (success, text) = match parser.parse_and_recv(resp).await {
+            let mut resp = match parser.parse_and_recv(resp).await {
                 Ok(x) => x,
                 Err(TuziError::Nom(nom::Err::Incomplete(Needed::Unknown))) => break,
                 Err(e) => return Err(e),
             };
+
+            if resp.ty == ResponseType::Array {
+                let mut args = Vec::new();
+                for _ in 0..resp.count {
+                    let arg = parser.parse_and_recv(req_arg).await?;
+                    args.push(arg);
+                }
+                resp.param = args.join(" ");
+            }
+
+            let success = resp.success;
+            let text = resp.param;
 
             info!(?success, ?text, "redis response");
 
@@ -262,18 +280,62 @@ fn req_arg(input: &[u8]) -> IResult<&[u8], String> {
     Ok((input, arg))
 }
 
-fn resp(input: &[u8]) -> IResult<&[u8], (bool, String)> {
-    alt((resp_simple, resp_error))(input)
+struct ResponseParam {
+    ty: ResponseType,
+    success: bool,
+    count: isize,
+    param: String,
 }
 
-fn resp_simple(input: &[u8]) -> IResult<&[u8], (bool, String)> {
+#[derive(PartialEq)]
+enum ResponseType {
+    Simple,
+    Error,
+    Array,
+}
+
+fn resp(input: &[u8]) -> IResult<&[u8], ResponseParam> {
+    context("resp" , alt((
+        context("simple", resp_simple),
+        context("error", resp_error),
+        context("array", resp_array),
+    ))) (input)
+}
+
+fn resp_simple(input: &[u8]) -> IResult<&[u8], ResponseParam> {
     map(delimited(tag("+"), is_not("\r\n"), crlf), |s: &[u8]| {
-        (true, String::from_utf8(s.to_vec()).unwrap())
+        ResponseParam {
+            ty: ResponseType::Simple,
+            success: true,
+            count: 0,
+            param: String::from_utf8(s.to_vec()).unwrap(),
+        }
     })(input)
 }
 
-fn resp_error(input: &[u8]) -> IResult<&[u8], (bool, String)> {
+fn resp_error(input: &[u8]) -> IResult<&[u8], ResponseParam> {
     map(delimited(tag("-"), is_not("\r\n"), crlf), |s: &[u8]| {
-        (false, String::from_utf8(s.to_vec()).unwrap())
+        ResponseParam {
+            ty: ResponseType::Error,
+            success: false,
+            count: 0,
+            param: String::from_utf8(s.to_vec()).unwrap(),
+        }
     })(input)
+}
+
+fn resp_array(input: &[u8]) -> IResult<&[u8], ResponseParam> {
+    delimited(
+        tag("*"),
+        map(digit1, |s| {
+            let count: isize = str::from_utf8(s).unwrap().parse().unwrap();
+            ResponseParam {
+                ty: ResponseType::Array,
+                success: count >= 0,
+                count,
+                param: "".to_string()
+            }
+        }),
+        crlf,
+    )(input)
 }

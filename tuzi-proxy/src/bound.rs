@@ -45,7 +45,7 @@ async fn new_protocol_parsers(wg: WaitGroup) -> Arc<HashMap<Protocol, Arc<dyn Pr
 
     let protocol_parsers: &[Arc<dyn ProtocolParsable>] = &[
         Arc::new(http1::Parser),
-        Arc::new(redis::Parser::new(collector, wg).await),
+        Arc::new(redis::Parser::new(collector)),
     ];
     let protocol_parsers = protocol_parsers
         .iter()
