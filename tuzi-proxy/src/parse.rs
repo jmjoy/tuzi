@@ -2,13 +2,14 @@ pub mod http1;
 pub mod redis;
 
 use crate::{
+    bound::protocol_parse,
     error::{TuziError, TuziResult},
     io::Receivable,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
 use nom::{IResult, Needed};
-use std::{io, mem::replace, net::SocketAddr};
+use std::{future::Future, io, mem::replace, net::SocketAddr};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -16,9 +17,9 @@ use tokio::{
         broadcast::{self},
         mpsc,
     },
+    task::JoinHandle,
 };
 use tracing::debug;
-use tokio::task::JoinHandle;
 
 pub type Protocol = &'static str;
 
@@ -109,9 +110,8 @@ pub struct ResponseParserDelivery {
 }
 
 #[async_trait]
-pub trait ProtocolParsable: Send + Sync {
+pub trait ParseProtocol: Send + Sync {
     fn protocol(&self) -> Protocol;
-    fn daemon(&self) -> Option<JoinHandle<()>>;
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()>;
     async fn parse_response(&self, mut delivery: ResponseParserDelivery) -> TuziResult<()>;
 }

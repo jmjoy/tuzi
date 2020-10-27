@@ -1,11 +1,12 @@
 use crate::{
-    collect::{Collectable, Record},
+    collect::{Collect, Record},
     error::{TuziError, TuziResult},
     parse::{
-        ProtocolParsable, ReceiveParser, RequestParsedContent, RequestParsedData,
+        ParseProtocol, ReceiveParser, RequestParsedContent, RequestParsedData,
         RequestParserDelivery, ResponseParserDelivery,
     },
     wait::WaitGroup,
+    Protocol,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -14,6 +15,7 @@ use nom::{
     bytes::streaming::{is_not, tag, take},
     character::streaming::{crlf, digit1},
     combinator::map,
+    error::context,
     lib::std::collections::HashMap,
     multi::many_till,
     sequence::{delimited, terminated},
@@ -31,10 +33,11 @@ use std::{
 use tokio::{
     io::{copy, AsyncWriteExt},
     sync::{mpsc, Mutex},
+    task::JoinHandle,
 };
 use tracing::info;
-use nom::error::context;
-use tokio::task::JoinHandle;
+
+const PROTOCOL: &'static str = "redis";
 
 #[derive(Debug)]
 enum CollectMeta {
@@ -65,7 +68,7 @@ struct Response {
 
 pub struct Collector {
     protocol: &'static str,
-    collectable: Arc<dyn Collectable>,
+    collector: Arc<dyn Collect>,
     receiver: mpsc::Receiver<CollectMeta>,
     wg: WaitGroup,
 }
@@ -104,7 +107,7 @@ impl Collector {
                             response: Some(response_tags),
                         };
 
-                        self.collectable.collect(record).await;
+                        self.collector.collect(record).await;
 
                         sess_request = None;
                     }
@@ -120,33 +123,32 @@ impl Collector {
     }
 }
 
-pub struct Parser {
+pub struct RedisParser {
     collect_sender: Mutex<mpsc::Sender<CollectMeta>>,
 }
 
-impl Parser {
-    pub fn new(collectable: Arc<dyn Collectable>) -> Self {
-        Self {
+impl RedisParser {
+    pub fn new(collector: Arc<dyn Collect>, wg: WaitGroup) -> Self {
+        let (sender, receiver) = mpsc::channel(16);
+        let parser = RedisParser {
             collect_sender: Mutex::new(sender),
-        }
+        };
+        let collector = Collector {
+            protocol: parser.protocol(),
+            collector,
+            receiver,
+            wg,
+        };
+        tokio::spawn(collector.listening());
+        parser
     }
 }
 
 #[async_trait]
-impl ProtocolParsable for Parser {
-    fn protocol(&self) -> &'static str {
-        "redis"
-    }
-
-    fn daemon(&self) -> Option<JoinHandle<()>> {
-        let (sender, receiver) = mpsc::channel(16);
-        let collector = Collector {
-            protocol: parser.protocol(),
-            collectable,
-            receiver,
-            wg,
-        };
-        let handle = tokio::spawn(collector.listening());
+impl ParseProtocol for RedisParser {
+    #[inline]
+    fn protocol(&self) -> Protocol {
+        PROTOCOL
     }
 
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()> {
@@ -295,11 +297,14 @@ enum ResponseType {
 }
 
 fn resp(input: &[u8]) -> IResult<&[u8], ResponseParam> {
-    context("resp" , alt((
-        context("simple", resp_simple),
-        context("error", resp_error),
-        context("array", resp_array),
-    ))) (input)
+    context(
+        "resp",
+        alt((
+            context("simple", resp_simple),
+            context("error", resp_error),
+            context("array", resp_array),
+        )),
+    )(input)
 }
 
 fn resp_simple(input: &[u8]) -> IResult<&[u8], ResponseParam> {
@@ -333,7 +338,7 @@ fn resp_array(input: &[u8]) -> IResult<&[u8], ResponseParam> {
                 ty: ResponseType::Array,
                 success: count >= 0,
                 count,
-                param: "".to_string()
+                param: "".to_string(),
             }
         }),
         crlf,

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Local};
 use indexmap::map::IndexMap;
 use nom::lib::std::{collections::LinkedList, fmt::Formatter};
+use serde::{Serialize, Serializer};
 use std::{
     collections::HashMap,
     fmt,
@@ -10,10 +11,9 @@ use std::{
     net::SocketAddr,
     time::{Duration, SystemTime},
 };
-use serde::{Serialize, Serializer};
 
 #[async_trait]
-pub trait Collectable: Send + Sync {
+pub trait Collect: Send + Sync {
     async fn collect(&self, record: Record);
 }
 
@@ -28,9 +28,13 @@ impl<S: AsRef<str>> StdoutCollector<S> {
 }
 
 #[async_trait]
-impl<S: AsRef<str> + Send + Sync> Collectable for StdoutCollector<S> {
+impl<S: AsRef<str> + Send + Sync> Collect for StdoutCollector<S> {
     async fn collect(&self, record: Record) {
-        println!("{}{}", self.prefix.as_ref(), serde_json::to_string(&record).unwrap());
+        println!(
+            "{}{}",
+            self.prefix.as_ref(),
+            serde_json::to_string(&record).unwrap()
+        );
     }
 }
 
@@ -49,7 +53,10 @@ pub struct Record {
     pub response: Option<HashMap<String, String>>,
 }
 
-fn serialize_system_time<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error> where S: Serializer {
+fn serialize_system_time<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
     let datetime: DateTime<Local> = time.clone().into();
     s.serialize_str(&format!("{}", datetime))
 }

@@ -3,7 +3,7 @@ use crate::{
     error::{TuziError, TuziResult},
     io::receive_copy,
     parse::{
-        delivery, http1, redis, ClientToProxyDelivery, Protocol, ProtocolParsable,
+        delivery, http1, redis, ClientToProxyDelivery, ParseProtocol, Protocol,
         ProxyToServerDelivery, RequestParsedContent, RequestParsedData, RequestParserDelivery,
         ResponseParserDelivery, ResponseParserReader, ServerToProxyDelivery,
     },
@@ -40,18 +40,18 @@ use tokio::{
 };
 use tracing::{debug, info, instrument};
 
-async fn new_protocol_parsers(wg: WaitGroup) -> Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>> {
+async fn new_protocol_parsers(wg: WaitGroup) -> Arc<HashMap<Protocol, Arc<dyn ParseProtocol>>> {
     let collector = Arc::new(StdoutCollector::new("==> "));
 
-    let protocol_parsers: &[Arc<dyn ProtocolParsable>] = &[
-        Arc::new(http1::Parser),
-        Arc::new(redis::Parser::new(collector)),
+    let parsers: &[Arc<dyn ParseProtocol>] = &[
+        Arc::new(http1::Http1Parser),
+        Arc::new(redis::RedisParser::new(collector, wg)),
     ];
-    let protocol_parsers = protocol_parsers
+    let parsers = parsers
         .iter()
         .map(|parser| (parser.protocol(), parser.clone()))
         .collect();
-    Arc::new(protocol_parsers)
+    Arc::new(parsers)
 }
 
 pub enum Bound {
@@ -71,13 +71,13 @@ pub async fn outbound(configuration: Rc<Configuration>) {
 
 struct Context {
     start_time: SystemTime,
-    protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>,
+    parsers: Arc<HashMap<Protocol, Arc<dyn ParseProtocol>>>,
 }
 
 impl Context {
-    fn new(protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>) -> Self {
+    fn new(protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ParseProtocol>>>) -> Self {
         Self {
-            protocol_parsers,
+            parsers: protocol_parsers,
             start_time: SystemTime::now(),
         }
     }
@@ -169,7 +169,7 @@ async fn handle(
         mut parser_deliveries,
         proxy_to_server_delivery,
         server_to_proxy_delivery,
-    ) = delivery(context.protocol_parsers.len(), client_addr, server_addr);
+    ) = delivery(context.parsers.len(), client_addr, server_addr);
 
     let mut handles = Vec::new();
 
@@ -180,21 +180,21 @@ async fn handle(
         client_to_proxy_delivery,
     )));
 
-    for (_, protocol_parser) in context.protocol_parsers.iter() {
+    for (_, parser) in context.parsers.iter() {
         let delivery = parser_deliveries.pop().unwrap();
-        let protocol_parser = protocol_parser.clone();
-        handles.push(tokio::spawn(parser(
+        let parser = parser.clone();
+        handles.push(tokio::spawn(protocol_parse(
             client_addr.clone(),
             server_addr.clone(),
             delivery,
-            protocol_parser,
+            parser,
         )));
     }
 
     handles.push(tokio::spawn(proxy_to_server(
         client_addr.clone(),
         server_addr.clone(),
-        context.protocol_parsers.keys().map(|p| *p).collect(),
+        context.parsers.keys().map(|p| *p).collect(),
         orig_write,
         proxy_to_server_delivery,
     )));
@@ -202,7 +202,7 @@ async fn handle(
     handles.push(tokio::spawn(server_to_proxy(
         client_addr.clone(),
         server_addr.clone(),
-        context.protocol_parsers.clone(),
+        context.parsers.clone(),
         orig_read,
         socket_write,
         server_to_proxy_delivery,
@@ -246,20 +246,20 @@ async fn client_to_proxy(
     }
 }
 
-#[instrument(skip(delivery, protocol_parser))]
-async fn parser(
+#[instrument(skip(delivery, parser))]
+pub async fn protocol_parse(
     client: SocketAddr,
     server: SocketAddr,
     delivery: RequestParserDelivery,
-    protocol_parser: Arc<dyn ProtocolParsable>,
+    mut parser: Arc<dyn ParseProtocol>,
 ) {
     let mut request_parsed_sender = delivery.request_parsed_sender.clone();
-    if let Err(e) = protocol_parser.parse_request(delivery).await {
+    if let Err(e) = parser.parse_request(delivery).await {
         match e {
             TuziError::Nom(_) => {
                 request_parsed_sender
                     .send(RequestParsedData {
-                        protocol: protocol_parser.protocol(),
+                        protocol: parser.protocol(),
                         content: RequestParsedContent::Failed,
                     })
                     .await
@@ -384,7 +384,7 @@ async fn detect_protocol<'a>(
 async fn server_to_proxy(
     client: SocketAddr,
     server: SocketAddr,
-    protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ProtocolParsable>>>,
+    protocol_parsers: Arc<HashMap<Protocol, Arc<dyn ParseProtocol>>>,
     mut server_read: OwnedReadHalf,
     mut client_write: OwnedWriteHalf,
     mut delivery: ServerToProxyDelivery,

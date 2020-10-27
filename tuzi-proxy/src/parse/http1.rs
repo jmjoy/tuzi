@@ -1,7 +1,7 @@
 use crate::{
     error::TuziResult,
     parse::{
-        Protocol, ProtocolParsable, ReceiveParser, RequestParsedContent, RequestParsedData,
+        ParseProtocol, Protocol, ReceiveParser, RequestParsedContent, RequestParsedData,
         RequestParserDelivery, ResponseParserDelivery,
     },
 };
@@ -19,9 +19,13 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
-
-use tokio::io::{copy, AsyncWriteExt};
+use tokio::{
+    io::{copy, AsyncWriteExt},
+    task::JoinHandle,
+};
 use tracing::{debug, info};
+
+const PROTOCOL: &'static str = "http/1";
 
 #[derive(Debug, PartialEq)]
 pub struct RequestBegin {
@@ -30,13 +34,13 @@ pub struct RequestBegin {
     version: Version,
 }
 
-pub struct Parser;
+pub struct Http1Parser;
 
 #[async_trait]
-impl ProtocolParsable for Parser {
+impl ParseProtocol for Http1Parser {
     #[inline]
     fn protocol(&self) -> Protocol {
-        "http/1"
+        PROTOCOL
     }
 
     async fn parse_request(&self, mut delivery: RequestParserDelivery) -> TuziResult<()> {
